@@ -1,0 +1,5 @@
+/torrmedia
+/deploy/torrmedia
+/deploy/torrmedia-*
+/deploy/SHA256SUMS
+.DS_Store

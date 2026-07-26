@@ -1,0 +1,24 @@
+[Unit]
+Description=torrmedia library server
+After=network-online.target qbittorrent.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=torrmedia
+Group=torrmedia
+SupplementaryGroups=qbittorrent
+EnvironmentFile=/etc/torrmedia/config.env
+StateDirectory=torrmedia
+StateDirectoryMode=0750
+ExecStart=/usr/local/bin/torrmedia
+Restart=on-failure
+RestartSec=3
+NoNewPrivileges=true
+MemoryAccounting=true
+MemoryHigh=256M
+MemoryMax=384M
+OOMScoreAdjust=500
+
+[Install]
+WantedBy=multi-user.target
