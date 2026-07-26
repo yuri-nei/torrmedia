@@ -80,7 +80,6 @@ systemctl restart torrmedia
 sleep 1
 echo "== status =="
 systemctl --no-pager --lines=5 status torrmedia | grep -E "●|Active:|Main PID" || true
-RUNNING="$(/usr/local/bin/torrmedia --version 2>/dev/null || true)"
 ss -tln | grep -q ":${TORRMEDIA_LISTEN##*:}" || ss -tln | grep 8091 || echo "WARN: port is not listening"
 echo
 echo "Done. No port was opened to the outside: set up the firewall or VPN yourself (see README)."

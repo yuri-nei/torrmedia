@@ -1227,6 +1227,8 @@ func (s *server) handleEnable(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	s.inflight.Add(1)
+	defer s.inflight.Done()
 	unlock := s.lockTorrent(hash)
 	defer unlock()
 
