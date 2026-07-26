@@ -51,7 +51,15 @@ func newViewedStore(path string) (*viewedStore, error) {
 	}
 	var stored viewedFile
 	if err := json.Unmarshal(data, &stored); err != nil {
-		return nil, fmt.Errorf("decode: %w", err)
+		corrupt := fmt.Sprintf("%s.corrupt-%d", path, time.Now().Unix())
+		if renameErr := os.Rename(path, corrupt); renameErr != nil {
+			log.Printf("viewed: %q is corrupt (%v) and could not be moved aside (%v); "+
+				"starting with empty state, the file will be overwritten", path, err, renameErr)
+		} else {
+			log.Printf("viewed: %q is corrupt (%v); moved to %q, starting with empty state",
+				path, err, corrupt)
+		}
+		return v, nil
 	}
 	for _, entry := range stored.Items {
 		if entry.Path != "" {
@@ -91,8 +99,16 @@ func (v *viewedStore) list(path, item string) []viewedEntry {
 func (v *viewedStore) update(fn func(map[string]viewedEntry)) error {
 	v.mu.Lock()
 	defer v.mu.Unlock()
+	backup := make(map[string]viewedEntry, len(v.items))
+	for path, entry := range v.items {
+		backup[path] = entry
+	}
 	fn(v.items)
-	return v.saveLocked()
+	if err := v.saveLocked(); err != nil {
+		v.items = backup
+		return err
+	}
+	return nil
 }
 
 func (v *viewedStore) saveLocked() error {
@@ -129,7 +145,15 @@ func (v *viewedStore) saveLocked() error {
 	if err := tmp.Close(); err != nil {
 		return err
 	}
-	return os.Rename(tmpName, v.path)
+	if err := os.Rename(tmpName, v.path); err != nil {
+		return err
+	}
+	dirFile, err := os.Open(dir)
+	if err != nil {
+		return err
+	}
+	defer dirFile.Close()
+	return dirFile.Sync()
 }
 
 type playbackConfig struct {
@@ -361,6 +385,8 @@ type countingWriter struct {
 	total *atomic.Int64
 }
 
+func (w *countingWriter) Unwrap() http.ResponseWriter { return w.ResponseWriter }
+
 func (w *countingWriter) Write(p []byte) (int, error) {
 	n, err := w.ResponseWriter.Write(p)
 	w.total.Add(int64(n))
@@ -389,6 +415,20 @@ func (w *countingWriter) ReadFrom(r io.Reader) (int64, error) {
 			return total, readErr
 		}
 	}
+}
+
+func trackableRange(header string) bool {
+	if header == "" {
+		return true
+	}
+	if !strings.HasPrefix(header, "bytes=") {
+		return false
+	}
+	spec := strings.TrimPrefix(header, "bytes=")
+	if strings.Contains(spec, ",") {
+		return false
+	}
+	return !strings.HasPrefix(strings.TrimSpace(spec), "-")
 }
 
 func rangeStart(header string) int64 {

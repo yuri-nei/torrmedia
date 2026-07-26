@@ -2,6 +2,8 @@ package main
 
 import (
 	"bytes"
+	"context"
+	"crypto/subtle"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -14,11 +16,13 @@ import (
 	"net/http/cookiejar"
 	"net/url"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 )
@@ -49,20 +53,27 @@ type fileEntry struct {
 	Mtime int64  `json:"mtime"`
 	Watch string `json:"watch,omitempty"`
 	Pos   int64  `json:"pos,omitempty"`
+
+	TorrentHash string `json:"torrent_hash"`
+	QbitFileID  int    `json:"qbit_file_id"`
 }
 
 type item struct {
-	Title string      `json:"title"`
-	Path  string      `json:"path"`
-	Files []fileEntry `json:"files"`
+	Title       string      `json:"title"`
+	Path        string      `json:"path"`
+	TorrentHash string      `json:"torrent_hash"`
+	Files       []fileEntry `json:"files"`
 }
 
 type server struct {
-	root  string
-	token string
-	qb    *qbit
+	root   string
+	osRoot *os.Root
+	token  string
+	qb     *qbit
 
-	torrentLocks sync.Map // map[infohash]*sync.Mutex
+	locks *lockTable
+
+	streams *streamRegistry
 
 	deleteMu       sync.Mutex
 	deleteBatches  map[string]*deleteBatch
@@ -75,16 +86,47 @@ type server struct {
 
 	viewed   *viewedStore
 	playback playbackConfig
+
+	draining atomic.Bool
+	inflight sync.WaitGroup
+	probe    qbitProbe
+	initOnce sync.Once
+}
+
+func (s *server) ensureRuntime() {
+	s.initOnce.Do(func() {
+		if s.locks == nil {
+			s.locks = newLockTable()
+		}
+		if s.streams == nil {
+			s.streams = newStreamRegistry()
+		}
+		if s.osRoot == nil && s.root != "" {
+			if r, err := os.OpenRoot(s.root); err == nil {
+				s.osRoot = r
+			} else {
+				log.Printf("open root %q: %v", s.root, err)
+			}
+		}
+	})
 }
 
 func (s *server) lockTorrent(hash string) func() {
-	v, _ := s.torrentLocks.LoadOrStore(hash, &sync.Mutex{})
-	mu := v.(*sync.Mutex)
-	mu.Lock()
-	return mu.Unlock
+	s.ensureRuntime()
+	return s.locks.lock(hash)
 }
 
-const version = "2026-07-26.9"
+func (s *server) streamReg() *streamRegistry {
+	s.ensureRuntime()
+	return s.streams
+}
+
+func (s *server) fsRoot() *os.Root {
+	s.ensureRuntime()
+	return s.osRoot
+}
+
+const version = "2026-07-27.1"
 
 var errBadPath = errors.New("bad path")
 
@@ -119,11 +161,11 @@ func complete(info os.FileInfo) bool {
 	return st.Blocks*512 >= info.Size()
 }
 
-func (s *server) collectFiles(dir string) []fileEntry {
+func (s *server) collectFiles(dir string) ([]fileEntry, error) {
 	files := []fileEntry{}
-	filepath.WalkDir(dir, func(p string, d fs.DirEntry, err error) error {
+	err := filepath.WalkDir(dir, func(p string, d fs.DirEntry, err error) error {
 		if err != nil {
-			return nil
+			return fmt.Errorf("walk %q: %w", p, err)
 		}
 		if p != dir && hidden(d.Name()) {
 			if d.IsDir() {
@@ -138,18 +180,31 @@ func (s *server) collectFiles(dir string) []fileEntry {
 			return nil
 		}
 		info, err := d.Info()
-		if err != nil || !complete(info) {
+		if err != nil {
+			return fmt.Errorf("stat %q: %w", p, err)
+		}
+		if !complete(info) {
 			return nil
 		}
 		rel, err := filepath.Rel(s.root, p)
 		if err != nil {
-			return nil
+			return fmt.Errorf("rel %q: %w", p, err)
 		}
-		files = append(files, fileEntry{Name: d.Name(), Path: rel, Size: info.Size(), Mtime: info.ModTime().Unix()})
+		files = append(files, newFileEntry(d.Name(), rel, info))
 		return nil
 	})
+	if err != nil {
+		return nil, err
+	}
 	sort.Slice(files, func(i, j int) bool { return files[i].Path < files[j].Path })
-	return files
+	return files, nil
+}
+
+func newFileEntry(name, rel string, info os.FileInfo) fileEntry {
+	return fileEntry{
+		Name: name, Path: rel, Size: info.Size(), Mtime: info.ModTime().Unix(),
+		QbitFileID: -1,
+	}
 }
 
 func (s *server) fileItem(abs string, info os.FileInfo) (item, bool) {
@@ -160,41 +215,53 @@ func (s *server) fileItem(abs string, info os.FileInfo) (item, bool) {
 	if err != nil {
 		return item{}, false
 	}
-	fe := fileEntry{Name: info.Name(), Path: rel, Size: info.Size(), Mtime: info.ModTime().Unix()}
+	fe := newFileEntry(info.Name(), rel, info)
 	return item{Title: info.Name(), Path: rel, Files: []fileEntry{fe}}, true
 }
 
-func (s *server) dirItem(abs string) (item, bool) {
-	fl := s.collectFiles(abs)
+func (s *server) dirItem(abs string) (item, bool, error) {
+	fl, err := s.collectFiles(abs)
+	if err != nil {
+		return item{}, false, err
+	}
 	if len(fl) == 0 {
-		return item{}, false
+		return item{}, false, nil
 	}
 	rel, err := filepath.Rel(s.root, abs)
 	if err != nil {
-		return item{}, false
+		return item{}, false, err
 	}
-	return item{Title: filepath.Base(abs), Path: rel, Files: fl}, true
+	return item{Title: filepath.Base(abs), Path: rel, Files: fl}, true, nil
 }
 
-func (s *server) buildItems() []item {
+func (s *server) buildItems() ([]item, error) {
 	items := []item{}
-	addEntry := func(parent string, e fs.DirEntry) {
+	addEntry := func(parent string, e fs.DirEntry) error {
 		abs := filepath.Join(parent, e.Name())
 		if e.IsDir() {
-			if it, ok := s.dirItem(abs); ok {
+			it, ok, err := s.dirItem(abs)
+			if err != nil {
+				return err
+			}
+			if ok {
 				items = append(items, it)
 			}
-		} else if e.Type().IsRegular() {
-			if info, err := e.Info(); err == nil {
-				if it, ok := s.fileItem(abs, info); ok {
-					items = append(items, it)
-				}
+			return nil
+		}
+		if e.Type().IsRegular() {
+			info, err := e.Info()
+			if err != nil {
+				return fmt.Errorf("stat %q: %w", abs, err)
+			}
+			if it, ok := s.fileItem(abs, info); ok {
+				items = append(items, it)
 			}
 		}
+		return nil
 	}
 	top, err := os.ReadDir(s.root)
 	if err != nil {
-		return items
+		return nil, fmt.Errorf("read root: %w", err)
 	}
 	for _, e := range top {
 		if hidden(e.Name()) {
@@ -204,20 +271,68 @@ func (s *server) buildItems() []item {
 			cat := filepath.Join(s.root, e.Name())
 			sub, err := os.ReadDir(cat)
 			if err != nil {
-				continue
+				return nil, fmt.Errorf("read %q: %w", cat, err)
 			}
 			for _, c := range sub {
 				if hidden(c.Name()) {
 					continue
 				}
-				addEntry(cat, c)
+				if err := addEntry(cat, c); err != nil {
+					return nil, err
+				}
 			}
-		} else {
-			addEntry(s.root, e)
+		} else if err := addEntry(s.root, e); err != nil {
+			return nil, err
 		}
 	}
 	sort.Slice(items, func(i, j int) bool { return items[i].Title < items[j].Title })
-	return items
+	return items, nil
+}
+
+func (s *server) enrichOwnership(items []item) ([]item, bool) {
+	if s.qb == nil {
+		return items, true
+	}
+	idx, err := s.qb.ownership()
+	if err != nil {
+		log.Printf("list: ownership unavailable: %v", err)
+		return items, false
+	}
+	for i := range items {
+		hashes := map[string]struct{}{}
+		kept := items[i].Files[:0]
+		for j := range items[i].Files {
+			fe := items[i].Files[j]
+			abs := filepath.Join(s.root, fe.Path)
+			info, err := os.Stat(abs)
+			if err != nil {
+				continue
+			}
+			owner, found := idx.lookup(abs, info)
+			if found && owner.known() {
+				if owner.progress < 1 {
+					continue
+				}
+				fe.TorrentHash = owner.hash
+				fe.QbitFileID = owner.fileID
+				hashes[owner.hash] = struct{}{}
+			}
+			kept = append(kept, fe)
+		}
+		items[i].Files = kept
+		if len(hashes) == 1 {
+			for h := range hashes {
+				items[i].TorrentHash = h
+			}
+		}
+	}
+	kept := items[:0]
+	for _, it := range items {
+		if len(it.Files) > 0 {
+			kept = append(kept, it)
+		}
+	}
+	return kept, true
 }
 
 func writeJSON(w http.ResponseWriter, code int, v any) {
@@ -227,7 +342,7 @@ func writeJSON(w http.ResponseWriter, code int, v any) {
 }
 
 func writeErr(w http.ResponseWriter, code int, format string, a ...any) {
-	writeJSON(w, code, map[string]string{"error": fmt.Sprintf(format, a...)})
+	writeJSON(w, code, map[string]any{"ok": false, "error": fmt.Sprintf(format, a...)})
 }
 
 func pathErrCode(err error) int {
@@ -244,7 +359,12 @@ func (s *server) handleList(w http.ResponseWriter, r *http.Request) {
 	rel := r.URL.Query().Get("path")
 	var items []item
 	if rel == "" {
-		items = s.buildItems()
+		built, err := s.buildItems()
+		if err != nil {
+			writeErr(w, http.StatusInternalServerError, "list: %v", err)
+			return
+		}
+		items = built
 	} else {
 		abs, err := s.resolve(rel)
 		if err != nil {
@@ -258,15 +378,23 @@ func (s *server) handleList(w http.ResponseWriter, r *http.Request) {
 		}
 		items = []item{}
 		if info.IsDir() {
-			if it, ok := s.dirItem(abs); ok {
+			it, ok, err := s.dirItem(abs)
+			if err != nil {
+				writeErr(w, http.StatusInternalServerError, "list %q: %v", rel, err)
+				return
+			}
+			if ok {
 				items = append(items, it)
 			}
 		} else if it, ok := s.fileItem(abs, info); ok {
 			items = append(items, it)
 		}
 	}
+	items, qbitAvailable := s.enrichOwnership(items)
 	s.enrichViewed(items)
-	writeJSON(w, http.StatusOK, map[string]any{"items": items})
+	writeJSON(w, http.StatusOK, map[string]any{
+		"items": items, "qbit_available": qbitAvailable,
+	})
 }
 
 func (s *server) handleFile(w http.ResponseWriter, r *http.Request) {
@@ -276,7 +404,7 @@ func (s *server) handleFile(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, pathErrCode(err), "file %q: %v", rel, err)
 		return
 	}
-	f, err := os.Open(abs)
+	f, err := s.openInRoot(rel)
 	if err != nil {
 		writeErr(w, pathErrCode(err), "file %q: %v", rel, err)
 		return
@@ -287,6 +415,7 @@ func (s *server) handleFile(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusNotFound, "file %q: not a complete regular file", rel)
 		return
 	}
+	defer s.streamReg().acquire(inodeKey(info))()
 	ext := strings.ToLower(filepath.Ext(abs))
 	ct := mediaMime[ext]
 	if ct == "" {
@@ -298,14 +427,26 @@ func (s *server) handleFile(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", ct)
 	w.Header().Set("Accept-Ranges", "bytes")
 	w.Header().Set("ETag", fmt.Sprintf(`"%x-%x"`, info.Size(), info.ModTime().UnixNano()))
-	if r.Method != http.MethodGet || s.viewed == nil {
+	if r.Method != http.MethodGet || s.viewed == nil || !trackableRange(r.Header.Get("Range")) {
 		http.ServeContent(w, r, info.Name(), info.ModTime(), f)
 		return
 	}
 	tracker := newPlaybackTracker(s, rel, info.Size(), rangeStart(r.Header.Get("Range")))
+	defer tracker.finish()
 	cw := &countingWriter{ResponseWriter: w, total: &tracker.total}
 	http.ServeContent(cw, r, info.Name(), info.ModTime(), f)
-	tracker.finish()
+}
+
+func (s *server) openInRoot(rel string) (*os.File, error) {
+	clean, err := cleanRelative(rel)
+	if err != nil {
+		return nil, err
+	}
+	root := s.fsRoot()
+	if root == nil {
+		return nil, fmt.Errorf("media root %q is not available", s.root)
+	}
+	return root.Open(clean)
 }
 
 func (s *server) pruneEmptyDirs(dir string) {
@@ -341,6 +482,17 @@ type deleteBatchOutcome struct {
 	status   int
 	err      string
 	response map[string]any
+
+	perTarget map[string]*deleteBatchOutcome
+}
+
+func (o *deleteBatchOutcome) forTarget(rel string) *deleteBatchOutcome {
+	if o != nil && o.perTarget != nil {
+		if own, ok := o.perTarget[rel]; ok {
+			return own
+		}
+	}
+	return o
 }
 
 type preparedDelete struct {
@@ -369,6 +521,8 @@ func readAtFull(f *os.File, p []byte, off int64) error {
 	return nil
 }
 
+var errTooSmallToTrim = errors.New("file fits in two pieces; boundary data is shared with neighbours")
+
 func trimSparseFile(f *os.File, expected os.FileInfo, pieceSize int64) (trimResult, error) {
 	if pieceSize <= 0 || pieceSize > 64<<20 {
 		return trimResult{}, fmt.Errorf("unsafe piece size %d", pieceSize)
@@ -383,18 +537,18 @@ func trimSparseFile(f *os.File, expected os.FileInfo, pieceSize int64) (trimResu
 	size := current.Size()
 	before := allocatedBytes(current)
 
-	var prefix, suffix []byte
-	var suffixOff int64
-	if size > 2*pieceSize {
-		prefix = make([]byte, int(pieceSize))
-		suffix = make([]byte, int(pieceSize))
-		suffixOff = size - pieceSize
-		if err := readAtFull(f, prefix, 0); err != nil {
-			return trimResult{}, fmt.Errorf("read prefix: %w", err)
-		}
-		if err := readAtFull(f, suffix, suffixOff); err != nil {
-			return trimResult{}, fmt.Errorf("read suffix: %w", err)
-		}
+	if size <= 2*pieceSize {
+		return trimResult{}, errTooSmallToTrim
+	}
+
+	prefix := make([]byte, int(pieceSize))
+	suffix := make([]byte, int(pieceSize))
+	suffixOff := size - pieceSize
+	if err := readAtFull(f, prefix, 0); err != nil {
+		return trimResult{}, fmt.Errorf("read prefix: %w", err)
+	}
+	if err := readAtFull(f, suffix, suffixOff); err != nil {
+		return trimResult{}, fmt.Errorf("read suffix: %w", err)
 	}
 
 	if err := f.Truncate(0); err != nil {
@@ -460,18 +614,27 @@ func (s *server) handleDelete(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if m == nil {
+		if s.streamReg().active(inodeKey(info)) {
+			writeErr(w, http.StatusConflict, "file %q is being streamed right now", rel)
+			return
+		}
 		if err := os.Remove(abs); err != nil {
 			writeErr(w, http.StatusInternalServerError, "delete %q: %v", rel, err)
 			return
 		}
 		s.pruneEmptyDirs(filepath.Dir(abs))
 		log.Printf("delete: %s (not owned by a live torrent)", rel)
-		writeJSON(w, http.StatusOK, map[string]any{"deleted": rel, "torrent": nil})
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "deleted": rel, "torrent": nil, "warnings": []string{}})
 		return
 	}
 
+	canonicalRel, err := filepath.Rel(s.root, abs)
+	if err != nil {
+		writeErr(w, http.StatusForbidden, "delete %q: outside torrmedia root", rel)
+		return
+	}
 	s.queueTorrentDelete(w, r, &deleteTarget{
-		rel: rel, abs: abs, info: info, match: *m,
+		rel: canonicalRel, abs: abs, info: info, match: *m,
 	})
 }
 
@@ -493,7 +656,11 @@ func (s *server) handleTorrentFileDelete(
 	}
 	torrent, err := s.qb.torrent(hash)
 	if err != nil {
-		writeErr(w, http.StatusNotFound, "torrent %q: %v", hash, err)
+		status := http.StatusBadGateway
+		if errors.Is(err, errTorrentNotFound) {
+			status = http.StatusNotFound
+		}
+		writeErr(w, status, "torrent %q: %v", hash, err)
 		return
 	}
 	files, err := s.qb.files(hash)
@@ -547,17 +714,80 @@ func (s *server) queueTorrentDelete(w http.ResponseWriter, r *http.Request, targ
 	s.enqueueTorrentDelete(target)
 	select {
 	case outcome := <-result:
-		if outcome.err != "" {
-			writeErr(w, outcome.status, "%s", outcome.err)
+		own := outcome.forTarget(target.rel)
+		if own.err != "" {
+			writeErr(w, own.status, "%s", own.err)
 			return
 		}
-		resp := make(map[string]any, len(outcome.response)+1)
-		for key, value := range outcome.response {
+		resp := make(map[string]any, len(own.response)+2)
+		for key, value := range own.response {
 			resp[key] = value
 		}
+		resp["ok"] = true
 		resp["deleted"] = target.rel
-		writeJSON(w, outcome.status, resp)
+		writeJSON(w, own.status, resp)
 	case <-r.Context().Done():
+	}
+}
+
+func (s *server) cancelQueuedDelete(hash string, fileID int) bool {
+	s.deleteMu.Lock()
+	batch := s.deleteBatches[hash]
+	if batch == nil {
+		s.deleteMu.Unlock()
+		return false
+	}
+	var cancelled *deleteTarget
+	for rel, target := range batch.targets {
+		if target.match.fileID == fileID {
+			cancelled = target
+			delete(batch.targets, rel)
+			break
+		}
+	}
+	if cancelled != nil && len(batch.targets) == 0 {
+		if batch.timer != nil {
+			batch.timer.Stop()
+		}
+		delete(s.deleteBatches, hash)
+	}
+	s.deleteMu.Unlock()
+
+	if cancelled == nil {
+		return false
+	}
+	outcome := deleteBatchError(http.StatusConflict,
+		"queued delete for %q was cancelled by an enable request", cancelled.rel)
+	for _, waiter := range cancelled.waiters {
+		waiter <- outcome
+	}
+	log.Printf("delete: queued %s cancelled by enable (torrent=%s file=%d)", cancelled.rel, hash, fileID)
+	return true
+}
+
+func (s *server) pendingBatch(hash string) bool {
+	s.deleteMu.Lock()
+	defer s.deleteMu.Unlock()
+	return s.deleteBatches[hash] != nil
+}
+
+func (s *server) cancelAllQueuedDeletes() {
+	s.deleteMu.Lock()
+	batches := s.deleteBatches
+	s.deleteBatches = nil
+	s.deleteMu.Unlock()
+
+	for _, batch := range batches {
+		if batch.timer != nil {
+			batch.timer.Stop()
+		}
+		outcome := deleteBatchError(http.StatusServiceUnavailable,
+			"torrmedia is shutting down; nothing was deleted, retry after restart")
+		for _, target := range batch.targets {
+			for _, waiter := range target.waiters {
+				waiter <- outcome
+			}
+		}
 	}
 }
 
@@ -618,10 +848,13 @@ func (s *server) flushDeleteBatch(hash string, batch *deleteBatch, generation ui
 		}
 		return targets[i].match.fileID < targets[j].match.fileID
 	})
+	s.inflight.Add(1)
+	defer s.inflight.Done()
 	outcome := s.deleteTorrentBatch(hash, targets)
 	for _, target := range targets {
+		own := outcome.forTarget(target.rel)
 		for _, waiter := range target.waiters {
-			waiter <- outcome
+			waiter <- own
 		}
 	}
 }
@@ -641,10 +874,24 @@ func closePreparedDeletes(prepared []*preparedDelete) {
 	}
 }
 
-func (s *server) rollbackDeletePriorities(hash string, changed []*preparedDelete) {
+func (s *server) rollbackDeletePriorities(hash string, changed []*preparedDelete) []string {
+	var failures []string
 	for i := len(changed) - 1; i >= 0; i-- {
-		_ = s.qb.setFilePrio(hash, changed[i].target.match.fileID, changed[i].priority)
+		if err := s.qb.setFilePrio(hash, changed[i].target.match.fileID, changed[i].priority); err != nil {
+			failures = append(failures, fmt.Sprintf("file %d: %v", changed[i].target.match.fileID, err))
+		}
 	}
+	if len(failures) > 0 {
+		log.Printf("delete batch: rollback of priorities for %s failed: %s", hash, strings.Join(failures, "; "))
+	}
+	return failures
+}
+
+func rollbackNote(failures []string) string {
+	if len(failures) == 0 {
+		return "priorities rolled back"
+	}
+	return "ROLLBACK INCOMPLETE (" + strings.Join(failures, "; ") + ")"
 }
 
 func (s *server) deleteTorrentBatch(hash string, targets []*deleteTarget) *deleteBatchOutcome {
@@ -655,10 +902,22 @@ func (s *server) deleteTorrentBatch(hash string, targets []*deleteTarget) *delet
 	unlock := s.lockTorrent(hash)
 	defer unlock()
 
+	deadline := time.Now().Add(s.operationTimeout)
+	budget := func() (time.Duration, error) {
+		left := time.Until(deadline)
+		if left <= 0 {
+			return 0, fmt.Errorf("operation deadline of %s exceeded", s.operationTimeout)
+		}
+		return left, nil
+	}
+
 	torrent, err := s.qb.torrent(hash)
 	if err != nil {
-		return deleteBatchError(http.StatusBadGateway,
-			"qbittorrent refresh failed, nothing deleted: %v", err)
+		status := http.StatusBadGateway
+		if errors.Is(err, errTorrentNotFound) {
+			status = http.StatusNotFound
+		}
+		return deleteBatchError(status, "qbittorrent refresh failed, nothing deleted: %v", err)
 	}
 	if qbitCheckingState(torrent.State) {
 		return deleteBatchError(http.StatusConflict,
@@ -675,36 +934,40 @@ func (s *server) deleteTorrentBatch(hash string, targets []*deleteTarget) *delet
 			"qbittorrent files failed, nothing deleted: %v", err)
 	}
 
-	// Validate every qBit ID/path and pin every inode that currently exists
-	// before the first qBittorrent mutation. A missing file is a valid target:
-	// priority=0 must be applicable before qBit creates or downloads it.
 	prepared := make([]*preparedDelete, 0, len(targets))
+	rejected := make(map[string]*deleteBatchOutcome)
 	seenIDs := make(map[int]string, len(targets))
+	reject := func(target *deleteTarget, status int, format string, args ...any) {
+		rejected[target.rel] = deleteBatchError(status, format, args...)
+	}
 	for _, target := range targets {
 		if target.match.hash != hash {
-			closePreparedDeletes(prepared)
-			return deleteBatchError(http.StatusConflict,
-				"delete batch contains files from multiple torrents, nothing deleted")
+			reject(target, http.StatusConflict, "file %q belongs to another torrent", target.rel)
+			continue
 		}
 		if previous, exists := seenIDs[target.match.fileID]; exists {
-			closePreparedDeletes(prepared)
-			return deleteBatchError(http.StatusConflict,
-				"torrent file id %d is referenced by both %q and %q, nothing deleted",
+			reject(target, http.StatusConflict,
+				"torrent file id %d is referenced by both %q and %q",
 				target.match.fileID, previous, target.rel)
+			continue
 		}
 		seenIDs[target.match.fileID] = target.rel
 
 		qbFile, ok := qbFileByID(files, target.match.fileID)
 		if !ok {
-			closePreparedDeletes(prepared)
-			return deleteBatchError(http.StatusConflict,
-				"torrent file id %d disappeared, nothing deleted", target.match.fileID)
+			reject(target, http.StatusConflict, "torrent file id %d disappeared", target.match.fileID)
+			continue
 		}
 		currentAbs, err := s.torrentFilePath(torrent, qbFile)
 		if err != nil || filepath.Clean(currentAbs) != filepath.Clean(target.match.abs) {
-			closePreparedDeletes(prepared)
-			return deleteBatchError(http.StatusConflict,
-				"torrent path for file id %d changed, nothing deleted", target.match.fileID)
+			reject(target, http.StatusConflict,
+				"torrent path for file id %d changed", target.match.fileID)
+			continue
+		}
+		currentRel, err := filepath.Rel(s.root, currentAbs)
+		if err != nil {
+			reject(target, http.StatusForbidden, "torrent file %q is outside torrmedia root", target.rel)
+			continue
 		}
 		currentInfo, err := os.Stat(currentAbs)
 		if errors.Is(err, fs.ErrNotExist) {
@@ -714,28 +977,34 @@ func (s *server) deleteTorrentBatch(hash string, targets []*deleteTarget) *delet
 			continue
 		}
 		if err != nil || !currentInfo.Mode().IsRegular() {
-			closePreparedDeletes(prepared)
-			return deleteBatchError(http.StatusConflict,
-				"torrent path for %q is not a regular file, nothing deleted", target.rel)
+			reject(target, http.StatusConflict, "torrent path for %q is not a regular file", target.rel)
+			continue
 		}
 		if target.info != nil && !os.SameFile(target.info, currentInfo) {
-			closePreparedDeletes(prepared)
-			return deleteBatchError(http.StatusConflict,
-				"torrent inode for %q changed, nothing deleted", target.rel)
+			reject(target, http.StatusConflict, "torrent inode for %q changed", target.rel)
+			continue
 		}
-		f, err := os.OpenFile(currentAbs, os.O_RDWR, 0)
+		root := s.fsRoot()
+		if root == nil {
+			reject(target, http.StatusInternalServerError, "media root %q is not available", s.root)
+			continue
+		}
+		f, err := root.OpenFile(filepath.ToSlash(currentRel), os.O_RDWR, 0)
 		if err != nil {
-			closePreparedDeletes(prepared)
-			return deleteBatchError(http.StatusInternalServerError,
-				"open %q, nothing deleted: %v", target.rel, err)
+			reject(target, http.StatusInternalServerError, "open %q: %v", target.rel, err)
+			continue
 		}
 		pinnedInfo, err := f.Stat()
 		if err != nil || !pinnedInfo.Mode().IsRegular() ||
 			!os.SameFile(currentInfo, pinnedInfo) {
 			_ = f.Close()
-			closePreparedDeletes(prepared)
-			return deleteBatchError(http.StatusConflict,
-				"file %q changed while delete was prepared, nothing deleted", target.rel)
+			reject(target, http.StatusConflict, "file %q changed while delete was prepared", target.rel)
+			continue
+		}
+		if s.streamReg().active(inodeKey(pinnedInfo)) {
+			_ = f.Close()
+			reject(target, http.StatusConflict, "file %q is being streamed right now", target.rel)
+			continue
 		}
 		prepared = append(prepared, &preparedDelete{
 			target: target, file: f, info: pinnedInfo,
@@ -744,16 +1013,32 @@ func (s *server) deleteTorrentBatch(hash string, targets []*deleteTarget) *delet
 	}
 	defer closePreparedDeletes(prepared)
 
+	if len(prepared) == 0 {
+		out := deleteBatchError(http.StatusConflict, "no valid files in delete batch, nothing deleted")
+		out.perTarget = rejected
+		return out
+	}
+
+	warnings := []string{}
+
 	wasRunning := !qbitStoppedState(torrent.State)
 	if wasRunning {
 		if err := s.qb.switchTorrent(hash, "stop"); err != nil {
-			return deleteBatchError(http.StatusBadGateway,
+			out := deleteBatchError(http.StatusBadGateway,
 				"qbittorrent stop failed, nothing deleted: %v", err)
+			out.perTarget = rejected
+			return out
 		}
-		if err := s.qb.waitStopped(hash, s.operationTimeout, s.pollInterval); err != nil {
+		left, err := budget()
+		if err == nil {
+			err = s.qb.waitStopped(hash, left, s.pollInterval)
+		}
+		if err != nil {
 			_ = s.qb.switchTorrent(hash, "start")
-			return deleteBatchError(http.StatusGatewayTimeout,
+			out := deleteBatchError(http.StatusGatewayTimeout,
 				"qbittorrent did not stop, nothing deleted: %v", err)
+			out.perTarget = rejected
+			return out
 		}
 	}
 
@@ -763,22 +1048,26 @@ func (s *server) deleteTorrentBatch(hash string, targets []*deleteTarget) *delet
 			continue
 		}
 		changed = append(changed, item)
-		if err := s.qb.setFilePrio(hash, item.target.match.fileID, 0); err != nil {
-			s.rollbackDeletePriorities(hash, changed)
+		abort := func(status int, format string, args ...any) *deleteBatchOutcome {
+			note := rollbackNote(s.rollbackDeletePriorities(hash, changed))
 			if wasRunning {
-				_ = s.qb.switchTorrent(hash, "start")
+				if err := s.qb.switchTorrent(hash, "start"); err != nil {
+					note += fmt.Sprintf("; restart failed: %v", err)
+				}
 			}
-			return deleteBatchError(http.StatusBadGateway,
-				"qbittorrent filePrio failed, nothing trimmed: %v", err)
+			out := deleteBatchError(status, format+"; %s", append(args, note)...)
+			out.perTarget = rejected
+			return out
 		}
-		if err := s.qb.waitFilePriority(hash, item.target.match.fileID, 0,
-			s.operationTimeout, s.pollInterval); err != nil {
-			s.rollbackDeletePriorities(hash, changed)
-			if wasRunning {
-				_ = s.qb.switchTorrent(hash, "start")
-			}
-			return deleteBatchError(http.StatusGatewayTimeout,
-				"qbittorrent did not accept priority=0, nothing trimmed: %v", err)
+		if err := s.qb.setFilePrio(hash, item.target.match.fileID, 0); err != nil {
+			return abort(http.StatusBadGateway, "qbittorrent filePrio failed, nothing trimmed: %v", err)
+		}
+		left, err := budget()
+		if err == nil {
+			err = s.qb.waitFilePriority(hash, item.target.match.fileID, 0, left, s.pollInterval)
+		}
+		if err != nil {
+			return abort(http.StatusGatewayTimeout, "qbittorrent did not accept priority=0, nothing trimmed: %v", err)
 		}
 	}
 
@@ -786,6 +1075,7 @@ func (s *server) deleteTorrentBatch(hash string, targets []*deleteTarget) *delet
 		path    string
 		trimmed trimResult
 		absent  bool
+		kept    bool
 	}
 	deleted := make([]deletedFile, 0, len(prepared))
 	for _, item := range prepared {
@@ -800,25 +1090,50 @@ func (s *server) deleteTorrentBatch(hash string, targets []*deleteTarget) *delet
 			continue
 		}
 		trimmed, err := trimSparseFile(item.file, item.info, props.PieceSize)
+		if errors.Is(err, errTooSmallToTrim) {
+			warnings = append(warnings, fmt.Sprintf(
+				"%s: excluded from the torrent, but data kept on disk (%v)", item.target.rel, err))
+			deleted = append(deleted, deletedFile{
+				path:    item.target.rel,
+				trimmed: trimResult{logicalSize: item.size},
+				kept:    true,
+			})
+			continue
+		}
 		if err != nil {
-			// At least one inode may already be sparse. Keep every selected file
-			// stopped/unwanted and reconcile qBittorrent once; rolling priorities
-			// back here would make it re-download data the user asked to remove.
-			_ = s.qb.recheck(hash)
-			return deleteBatchError(http.StatusInternalServerError,
-				"batch trim failed at %q; torrent left stopped with selected priorities=0: %v",
-				item.target.rel, err)
+			note := "torrent left stopped"
+			if rcErr := s.qb.recheck(hash); rcErr != nil {
+				note = fmt.Sprintf("recheck also failed: %v", rcErr)
+			} else if wasRunning {
+				if startErr := s.qb.switchTorrent(hash, "start"); startErr != nil {
+					note = fmt.Sprintf("restart failed: %v", startErr)
+				} else {
+					note = "torrent restarted to repair neighbouring pieces"
+				}
+			}
+			out := deleteBatchError(http.StatusInternalServerError,
+				"batch trim failed at %q with selected priorities=0; %s: %v",
+				item.target.rel, note, err)
+			out.perTarget = rejected
+			return out
 		}
 		deleted = append(deleted, deletedFile{path: item.target.rel, trimmed: trimmed})
 	}
 	if err := s.qb.recheck(hash); err != nil {
-		return deleteBatchError(http.StatusBadGateway,
+		out := deleteBatchError(http.StatusBadGateway,
 			"files trimmed, but qbittorrent recheck failed; torrent left stopped: %v", err)
+		out.perTarget = rejected
+		return out
 	}
-	if err := s.qb.waitRecheck(hash, prepared[0].target.match.fileID,
-		s.operationTimeout, s.pollInterval); err != nil {
-		return deleteBatchError(http.StatusGatewayTimeout,
+	left, err := budget()
+	if err == nil {
+		err = s.qb.waitRecheck(hash, prepared[0].target.match.fileID, left, s.pollInterval)
+	}
+	if err != nil {
+		out := deleteBatchError(http.StatusGatewayTimeout,
 			"files trimmed, but qbittorrent recheck did not finish; torrent left stopped: %v", err)
+		out.perTarget = rejected
+		return out
 	}
 
 	fileResponses := make([]map[string]any, 0, len(deleted))
@@ -834,6 +1149,9 @@ func (s *server) deleteTorrentBatch(hash string, targets []*deleteTarget) *delet
 		if item.absent {
 			fileResponse["was_absent"] = true
 		}
+		if item.kept {
+			fileResponse["data_kept"] = true
+		}
 		fileResponses = append(fileResponses, fileResponse)
 	}
 	resp := map[string]any{
@@ -843,15 +1161,16 @@ func (s *server) deleteTorrentBatch(hash string, targets []*deleteTarget) *delet
 	}
 	if wasRunning {
 		if err := s.qb.switchTorrent(hash, "start"); err != nil {
-			resp["restart_error"] = err.Error()
+			warnings = append(warnings, fmt.Sprintf("torrent was not restarted: %v", err))
 			log.Printf("delete batch: restart %s failed after successful trim: %v", hash, err)
 		} else {
 			resp["torrent_restarted"] = true
 		}
 	}
-	log.Printf("delete batch: torrent=%s files=%d freed=%d retained=%d",
-		hash, len(deleted), totalFreed, totalRetained)
-	return &deleteBatchOutcome{status: http.StatusOK, response: resp}
+	resp["warnings"] = warnings
+	log.Printf("delete batch: torrent=%s files=%d freed=%d retained=%d warnings=%d",
+		hash, len(deleted), totalFreed, totalRetained, len(warnings))
+	return &deleteBatchOutcome{status: http.StatusOK, response: resp, perTarget: rejected}
 }
 
 func availableFilesystemBytes(path string) (int64, error) {
@@ -911,9 +1230,17 @@ func (s *server) handleEnable(w http.ResponseWriter, r *http.Request) {
 	unlock := s.lockTorrent(hash)
 	defer unlock()
 
+	if s.cancelQueuedDelete(hash, id) {
+		log.Printf("enable: cancelled queued delete for %s file=%d", hash, id)
+	}
+
 	t, err := s.qb.torrent(hash)
 	if err != nil {
-		writeErr(w, http.StatusNotFound, "torrent: %v", err)
+		status := http.StatusBadGateway
+		if errors.Is(err, errTorrentNotFound) {
+			status = http.StatusNotFound
+		}
+		writeErr(w, status, "torrent: %v", err)
 		return
 	}
 	if qbitCheckingState(t.State) {
@@ -940,7 +1267,11 @@ func (s *server) handleEnable(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusInternalServerError, "space check: %v", err)
 		return
 	}
-	available, err := s.availableBytes(t.SavePath)
+	spaceProbe := t.DownloadPath
+	if spaceProbe == "" {
+		spaceProbe = t.SavePath
+	}
+	available, err := s.availableBytes(spaceProbe)
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, "free space check: %v", err)
 		return
@@ -956,6 +1287,17 @@ func (s *server) handleEnable(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	rollback := func() string {
+		if !(file.Priority == 0) {
+			return "no rollback needed"
+		}
+		if err := s.qb.setFilePrio(hash, id, 0); err != nil {
+			log.Printf("enable: rollback of priority for %s file=%d failed: %v", hash, id, err)
+			return fmt.Sprintf("ROLLBACK INCOMPLETE: %v", err)
+		}
+		return "priority rolled back"
+	}
+
 	changed := file.Priority == 0
 	if changed {
 		if err := s.qb.setFilePrio(hash, id, 1); err != nil {
@@ -963,16 +1305,12 @@ func (s *server) handleEnable(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if err := s.qb.waitFilePriority(hash, id, 1, s.operationTimeout, s.pollInterval); err != nil {
-			_ = s.qb.setFilePrio(hash, id, 0)
-			writeErr(w, http.StatusGatewayTimeout, "qbittorrent did not accept priority=1: %v", err)
+			writeErr(w, http.StatusGatewayTimeout, "qbittorrent did not accept priority=1: %v; %s", err, rollback())
 			return
 		}
 	}
 	if err := s.qb.switchTorrent(hash, "start"); err != nil {
-		if changed {
-			_ = s.qb.setFilePrio(hash, id, 0)
-		}
-		writeErr(w, http.StatusBadGateway, "qbittorrent start failed; priority rolled back: %v", err)
+		writeErr(w, http.StatusBadGateway, "qbittorrent start failed: %v; %s", err, rollback())
 		return
 	}
 	startTimeout := 30 * time.Second
@@ -981,15 +1319,16 @@ func (s *server) handleEnable(w http.ResponseWriter, r *http.Request) {
 	}
 	after, err := s.qb.waitStarted(hash, startTimeout, s.pollInterval)
 	if err != nil {
-		_ = s.qb.switchTorrent(hash, "stop")
-		if changed {
-			_ = s.qb.setFilePrio(hash, id, 0)
+		note := ""
+		if stopErr := s.qb.switchTorrent(hash, "stop"); stopErr != nil {
+			note = fmt.Sprintf("; stop also failed: %v", stopErr)
 		}
-		writeErr(w, http.StatusGatewayTimeout, "torrent did not start; priority rolled back: %v", err)
+		writeErr(w, http.StatusGatewayTimeout, "torrent did not start: %v; %s%s", err, rollback(), note)
 		return
 	}
 	log.Printf("enable: %s file=%d required=%d available=%d state=%s", hash, id, required, available, after.State)
 	writeJSON(w, http.StatusOK, map[string]any{
+		"ok": true, "warnings": []string{},
 		"hash": hash, "file_id": id, "priority": 1, "started": true,
 		"state": after.State, "amount_left": after.AmountLeft,
 		"required_bytes": required, "available_bytes": available,
@@ -1085,12 +1424,32 @@ func (s *server) handleTorrent(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+func (s *server) guardTorrentMutation(w http.ResponseWriter, hash string) (func(), bool) {
+	if s.draining.Load() {
+		writeErr(w, http.StatusServiceUnavailable, "torrmedia is shutting down")
+		return nil, false
+	}
+	unlock := s.lockTorrent(hash)
+	if s.pendingBatch(hash) {
+		unlock()
+		writeErr(w, http.StatusConflict,
+			"a delete batch is queued for torrent %s; retry after it completes", hash)
+		return nil, false
+	}
+	return unlock, true
+}
+
 func (s *server) handleStartStop(action string) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		t, ok := s.torrentFor(w, r)
 		if !ok {
 			return
 		}
+		unlock, ok := s.guardTorrentMutation(w, t.Hash)
+		if !ok {
+			return
+		}
+		defer unlock()
 		legacy := map[string]string{"start": "resume", "stop": "pause"}[action]
 		err := s.qb.postOK("/api/v2/torrents/"+action, url.Values{"hashes": {t.Hash}})
 		if err != nil && legacy != "" {
@@ -1101,7 +1460,7 @@ func (s *server) handleStartStop(action string) http.HandlerFunc {
 			return
 		}
 		log.Printf("%s %s (%s): ok", action, t.Hash, t.Name)
-		writeJSON(w, http.StatusOK, map[string]any{"hash": t.Hash, action: "ok"})
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "hash": t.Hash, action: "ok"})
 	}
 }
 
@@ -1110,12 +1469,17 @@ func (s *server) handleRecheck(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	unlock, ok := s.guardTorrentMutation(w, t.Hash)
+	if !ok {
+		return
+	}
+	defer unlock()
 	if err := s.qb.recheck(t.Hash); err != nil {
 		writeErr(w, http.StatusBadGateway, "qbittorrent recheck: %v", err)
 		return
 	}
 	log.Printf("recheck %s (%s): started via API", t.Hash, t.Name)
-	writeJSON(w, http.StatusOK, map[string]any{"hash": t.Hash, "recheck": "started"})
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "hash": t.Hash, "recheck": "started"})
 }
 
 func (s *server) handleRemove(w http.ResponseWriter, r *http.Request) {
@@ -1123,12 +1487,17 @@ func (s *server) handleRemove(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	unlock, ok := s.guardTorrentMutation(w, t.Hash)
+	if !ok {
+		return
+	}
+	defer unlock()
 	if err := s.qb.deleteTorrent(t.Hash, false); err != nil {
 		writeErr(w, http.StatusBadGateway, "qbittorrent delete: %v", err)
 		return
 	}
 	log.Printf("remove %s (%s): torrent dropped, files kept", t.Hash, t.Name)
-	writeJSON(w, http.StatusOK, map[string]any{"hash": t.Hash, "removed": true, "files_kept": true})
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "hash": t.Hash, "removed": true, "files_kept": true})
 }
 
 func (s *server) handlePrio(w http.ResponseWriter, r *http.Request) {
@@ -1146,6 +1515,11 @@ func (s *server) handlePrio(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "ids required (comma-separated file indexes)")
 		return
 	}
+	unlock, ok := s.guardTorrentMutation(w, t.Hash)
+	if !ok {
+		return
+	}
+	defer unlock()
 	if err := s.qb.postOK("/api/v2/torrents/filePrio", url.Values{
 		"hash": {t.Hash}, "id": {strings.ReplaceAll(ids, ",", "|")}, "priority": {strconv.Itoa(prio)},
 	}); err != nil {
@@ -1153,7 +1527,7 @@ func (s *server) handlePrio(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	log.Printf("prio %s: ids=%s -> %d", t.Hash, ids, prio)
-	writeJSON(w, http.StatusOK, map[string]any{"hash": t.Hash, "ids": ids, "priority": prio})
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "hash": t.Hash, "ids": ids, "priority": prio})
 }
 
 func (s *server) handleAdd(w http.ResponseWriter, r *http.Request) {
@@ -1163,10 +1537,20 @@ func (s *server) handleAdd(w http.ResponseWriter, r *http.Request) {
 	}
 	q := r.URL.Query()
 	fields := map[string]string{}
-	for _, k := range []string{"savepath", "category"} {
-		if v := q.Get(k); v != "" {
-			fields[k] = v
+	if v := q.Get("savepath"); v != "" {
+		clean := filepath.Clean(v)
+		if !filepath.IsAbs(clean) || (clean != s.root && !strings.HasPrefix(clean, s.root+"/")) {
+			writeErr(w, http.StatusBadRequest, "savepath must be inside %s", s.root)
+			return
 		}
+		fields["savepath"] = clean
+	}
+	if v := q.Get("category"); v != "" {
+		if strings.ContainsAny(v, "/\\\x00") {
+			writeErr(w, http.StatusBadRequest, "category must not contain path separators")
+			return
+		}
+		fields["category"] = v
 	}
 	if q.Get("stopped") == "true" {
 		fields["stopped"] = "true" // qBit 5.x
@@ -1199,8 +1583,16 @@ func (s *server) handleAdd(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadGateway, "qbittorrent add: %v", err)
 		return
 	}
-	log.Printf("add: ok (%v)", fields)
-	writeJSON(w, http.StatusOK, map[string]any{"added": true})
+	log.Printf("add: ok (category=%q savepath=%q source=%s)",
+		fields["category"], fields["savepath"], addSource(q))
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "added": true, "warnings": []string{}})
+}
+
+func addSource(q url.Values) string {
+	if q.Get("file") != "" {
+		return "torrent-file"
+	}
+	return "magnet"
 }
 
 type qbit struct {
@@ -1317,11 +1709,29 @@ func (q *qbit) postOK(path string, form url.Values) error {
 	if err != nil {
 		return err
 	}
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<10))
 	io.Copy(io.Discard, resp.Body)
 	resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("POST %s: HTTP %d", path, resp.StatusCode)
+		return fmt.Errorf("POST %s: HTTP %d %s", path, resp.StatusCode, strings.TrimSpace(string(body)))
 	}
+	if text := strings.TrimSpace(string(body)); strings.HasPrefix(text, "Fails") {
+		return fmt.Errorf("POST %s: qbittorrent rejected the request (%s)", path, text)
+	}
+	return nil
+}
+
+func (q *qbit) getText(path string, out *string) error {
+	resp, err := q.doAuth("GET", path, nil)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<10))
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("GET %s: HTTP %d", path, resp.StatusCode)
+	}
+	*out = strings.TrimSpace(string(body))
 	return nil
 }
 
@@ -1393,6 +1803,9 @@ func (q *qbit) torrent(hash string) (*qbTorrent, error) {
 	err := q.getJSON("/api/v2/torrents/info?hashes="+url.QueryEscape(hash), &torrents)
 	if err != nil {
 		return nil, err
+	}
+	if len(torrents) == 0 {
+		return nil, fmt.Errorf("%w: %q", errTorrentNotFound, hash)
 	}
 	if len(torrents) != 1 {
 		return nil, fmt.Errorf("expected one torrent %q, got %d", hash, len(torrents))
@@ -1495,17 +1908,15 @@ func (q *qbit) waitFilePriority(hash string, id, priority int, timeout, interval
 }
 
 func (q *qbit) waitRecheck(hash string, id int, timeout, interval time.Duration) error {
-	sawChecking := false
+	settled := 0
+	const requiredSettled = 2
 	return pollUntil(timeout, interval, func() (bool, error) {
 		t, err := q.torrent(hash)
 		if err != nil {
 			return false, err
 		}
 		if qbitCheckingState(t.State) {
-			sawChecking = true
-			return false, nil
-		}
-		if !sawChecking {
+			settled = 0
 			return false, nil
 		}
 		if !qbitStoppedState(t.State) {
@@ -1518,7 +1929,8 @@ func (q *qbit) waitRecheck(hash string, id int, timeout, interval time.Duration)
 		if _, ok := qbFileByID(files, id); !ok {
 			return false, fmt.Errorf("file id %d disappeared after recheck", id)
 		}
-		return true, nil
+		settled++
+		return settled >= requiredSettled, nil
 	})
 }
 
@@ -1588,18 +2000,82 @@ func (q *qbit) deleteTorrent(hash string, deleteFiles bool) error {
 	})
 }
 
+var secretQueryKeys = map[string]bool{"magnet": true, "urls": true, "file": true, "savepath": true}
+
+func redactQuery(q url.Values) string {
+	if len(q) == 0 {
+		return ""
+	}
+	keys := make([]string, 0, len(q))
+	for k := range q {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	parts := make([]string, 0, len(keys))
+	for _, k := range keys {
+		if secretQueryKeys[k] {
+			parts = append(parts, k+"=[redacted]")
+			continue
+		}
+		parts = append(parts, k+"="+q.Get(k))
+	}
+	return "?" + strings.Join(parts, "&")
+}
+
 func (s *server) wrap(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if s.token != "" && r.URL.Path != "/health" &&
-			r.Header.Get("Authorization") != "Bearer "+s.token {
-			writeErr(w, http.StatusUnauthorized, "missing or invalid token")
-			return
+		if s.token != "" && r.URL.Path != "/health" {
+			expected := "Bearer " + s.token
+			got := r.Header.Get("Authorization")
+			if subtle.ConstantTimeCompare([]byte(got), []byte(expected)) != 1 {
+				writeErr(w, http.StatusUnauthorized, "missing or invalid token")
+				return
+			}
 		}
 		if r.Method != http.MethodGet {
-			log.Printf("%s %s %s", r.RemoteAddr, r.Method, r.URL.RequestURI())
+			if s.draining.Load() && r.URL.Path != "/viewed" {
+				writeErr(w, http.StatusServiceUnavailable, "torrmedia is shutting down")
+				return
+			}
+			log.Printf("%s %s %s%s", r.RemoteAddr, r.Method, r.URL.Path, redactQuery(r.URL.Query()))
 		}
 		next.ServeHTTP(w, r)
 	})
+}
+
+func (s *server) handleHealth(w http.ResponseWriter, _ *http.Request) {
+	status := healthStatus{OK: true, Version: version, Checks: map[string]string{}}
+	switch root := s.fsRoot(); {
+	case root == nil:
+		status.OK = false
+		status.Checks["root"] = "media root is not available"
+	default:
+		if _, err := root.Stat("."); err != nil {
+			status.OK = false
+			status.Checks["root"] = err.Error()
+		} else {
+			status.Checks["root"] = "ok"
+		}
+	}
+	if s.viewed == nil {
+		status.OK = false
+		status.Checks["viewed"] = "not configured"
+	} else {
+		status.Checks["viewed"] = "ok"
+	}
+	if s.qb != nil {
+		if err := s.probe.check(s.qb); err != nil {
+			status.OK = false
+			status.Checks["qbittorrent"] = err.Error()
+		} else {
+			status.Checks["qbittorrent"] = "ok"
+		}
+	}
+	code := http.StatusOK
+	if !status.OK {
+		code = http.StatusServiceUnavailable
+	}
+	writeJSON(w, code, status)
 }
 
 func envOr(key, def string) string {
@@ -1625,10 +2101,7 @@ func onlyMethod(method string, handler http.HandlerFunc) http.HandlerFunc {
 // silently become literal paths in legacy builds.
 func (s *server) routes() http.Handler {
 	mux := http.NewServeMux()
-	mux.HandleFunc("/health", onlyMethod(http.MethodGet, func(w http.ResponseWriter, _ *http.Request) {
-		w.Header().Set("Content-Type", "text/plain")
-		io.WriteString(w, "ok\n")
-	}))
+	mux.HandleFunc("/health", onlyMethod(http.MethodGet, s.handleHealth))
 	mux.HandleFunc("/list", onlyMethod(http.MethodGet, s.handleList))
 	handleFile := func(w http.ResponseWriter, r *http.Request) {
 		switch r.Method {
@@ -1669,15 +2142,24 @@ func main() {
 	if err != nil {
 		log.Fatalf("TORRMEDIA_ROOT: %v", err)
 	}
+	root = strings.TrimSuffix(root, "/")
+	osRoot, err := os.OpenRoot(root)
+	if err != nil {
+		log.Fatalf("TORRMEDIA_ROOT: %v", err)
+	}
+	defer osRoot.Close()
 	s := &server{
-		root:             strings.TrimSuffix(root, "/"),
+		root:             root,
+		osRoot:           osRoot,
 		token:            os.Getenv("TORRMEDIA_TOKEN"),
 		deleteDebounce:   30 * time.Second,
-		operationTimeout: 10 * time.Minute,
+		operationTimeout: 5 * time.Minute,
 		pollInterval:     250 * time.Millisecond,
 		enableReserve:    512 << 20,
 		availableBytes:   availableFilesystemBytes,
 		playback:         defaultPlaybackConfig(),
+		locks:            newLockTable(),
+		streams:          newStreamRegistry(),
 	}
 	if err := parsePlaybackConfig(&s.playback); err != nil {
 		log.Fatal(err)
@@ -1685,6 +2167,11 @@ func main() {
 	s.viewed, err = newViewedStore(envOr("TORRMEDIA_VIEWED_FILE", "/var/lib/torrmedia/viewed.json"))
 	if err != nil {
 		log.Fatalf("TORRMEDIA_VIEWED_FILE: %v", err)
+	}
+	if s.token == "" {
+		log.Printf("WARNING: TORRMEDIA_TOKEN is not set — the API is open to anyone who can reach %s. "+
+			"Set TORRMEDIA_TOKEN or keep the port behind a firewall/VPN (see README).",
+			envOr("TORRMEDIA_LISTEN", ":8091"))
 	}
 	if v := os.Getenv("TORRMEDIA_OPERATION_TIMEOUT"); v != "" {
 		d, err := time.ParseDuration(v)
@@ -1720,5 +2207,35 @@ func main() {
 		IdleTimeout:       2 * time.Minute,
 	}
 	log.Printf("torrmedia %s: listen=%s root=%s qbit=%t", version, listen, s.root, s.qb != nil)
-	log.Fatal(srv.ListenAndServe())
+
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
+	errCh := make(chan error, 1)
+	go func() { errCh <- srv.ListenAndServe() }()
+
+	select {
+	case err := <-errCh:
+		if err != nil && !errors.Is(err, http.ErrServerClosed) {
+			log.Fatal(err)
+		}
+	case <-ctx.Done():
+		stop()
+		log.Printf("torrmedia: shutdown requested, draining")
+		s.draining.Store(true)
+		s.cancelAllQueuedDeletes()
+		done := make(chan struct{})
+		go func() { s.inflight.Wait(); close(done) }()
+		select {
+		case <-done:
+		case <-time.After(s.operationTimeout + 30*time.Second):
+			log.Printf("torrmedia: in-flight operations did not finish in time")
+		}
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		if err := srv.Shutdown(shutdownCtx); err != nil {
+			log.Printf("torrmedia: shutdown: %v", err)
+		}
+		log.Printf("torrmedia: stopped cleanly")
+	}
 }

@@ -285,7 +285,11 @@ func waitForDeleteBatchSize(t *testing.T, s *server, hash string, want int) {
 }
 
 func TestHTTPRoutesReachRegisteredHandlers(t *testing.T) {
-	s := &server{root: testRoot(t)}
+	store, err := newViewedStore(filepath.Join(t.TempDir(), "viewed.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := &server{root: testRoot(t), viewed: store}
 	handler := s.routes()
 
 	for _, test := range []struct {
@@ -563,7 +567,7 @@ func TestDeleteByHashAndIDBatchesPartialAndMissingFiles(t *testing.T) {
 	}
 }
 
-func TestDeleteBatchPreflightFailureDoesNotTrimValidSibling(t *testing.T) {
+func TestDeleteBatchRejectsOnlyTheInvalidTarget(t *testing.T) {
 	root := testRoot(t)
 	const fileSize = int64(1 << 20)
 	rels := []string{
@@ -609,7 +613,8 @@ func TestDeleteBatchPreflightFailureDoesNotTrimValidSibling(t *testing.T) {
 	}
 
 	// Simulate an external replacement after both requests were accepted.
-	// The package must fail closed before touching its still-valid sibling.
+	// Only the replaced file must be refused; its still-valid sibling has to be
+	// processed. Failing the whole batch silently dropped a correct user request.
 	if err := os.Remove(filepath.Join(root, rels[1])); err != nil {
 		t.Fatal(err)
 	}
@@ -622,20 +627,30 @@ func TestDeleteBatchPreflightFailureDoesNotTrimValidSibling(t *testing.T) {
 			t.Fatal("failed batch did not return")
 		}
 	}
-	for i, recorder := range recorders {
-		if recorder.Code != http.StatusConflict {
-			t.Fatalf("DELETE %d status=%d body=%s", i, recorder.Code, recorder.Body.String())
-		}
+	if recorders[0].Code != http.StatusOK {
+		t.Fatalf("valid sibling was refused: status=%d body=%s",
+			recorders[0].Code, recorders[0].Body.String())
 	}
-	if calls := fake.snapshotCalls(); len(calls) != 0 {
-		t.Fatalf("preflight failure mutated qBittorrent: %v", calls)
+	if recorders[1].Code != http.StatusConflict {
+		t.Fatalf("replaced file was not refused: status=%d body=%s",
+			recorders[1].Code, recorders[1].Body.String())
+	}
+	if body := recorders[1].Body.String(); !strings.Contains(body, rels[1]) {
+		t.Fatalf("per-target error does not name its own file: %s", body)
 	}
 	firstAfter, err := os.ReadFile(filepath.Join(root, rels[0]))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !bytes.Equal(firstAfter, firstOriginal) {
-		t.Fatal("valid sibling changed despite package preflight failure")
+	if bytes.Equal(firstAfter, firstOriginal) {
+		t.Fatal("valid sibling was not trimmed")
+	}
+	replaced, err := os.Stat(filepath.Join(root, rels[1]))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if allocatedBytes(replaced) < replaced.Size() {
+		t.Fatal("refused file was trimmed anyway")
 	}
 }
 

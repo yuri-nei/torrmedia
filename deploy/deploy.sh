@@ -2,9 +2,26 @@
 set -euo pipefail
 SRC="$(cd "$(dirname "$0")" && pwd)"
 
+echo "== 0. pick the artifact =="
+if [ ! -f "$SRC/SHA256SUMS" ]; then
+  echo "SHA256SUMS not found next to deploy.sh, nothing to verify" >&2
+  exit 1
+fi
+if [ -z "${TORRMEDIA_VERSION:-}" ]; then
+  TORRMEDIA_VERSION="$(awk '{print $2}' "$SRC/SHA256SUMS" | sed 's/^torrmedia-//' | sort -V | tail -1)"
+fi
+BINARY="torrmedia-$TORRMEDIA_VERSION"
+if [ ! -f "$SRC/$BINARY" ]; then
+  echo "no artifact $BINARY (see SHA256SUMS)" >&2
+  exit 1
+fi
+echo "version: $TORRMEDIA_VERSION"
+( cd "$SRC" && grep " $BINARY\$" SHA256SUMS | sha256sum -c - ) \
+  || { echo "checksum of $BINARY does not match, installation aborted" >&2; exit 1; }
+
 echo "== 1. system user =="
 if ! id -u torrmedia &>/dev/null; then
-  useradd -r -M -d /nonexistent -s /usr/sbin/nologin -G qbittorrent torrmedia
+  useradd -r -M -d /nonexistent -s /usr/sbin/nologin torrmedia
 fi
 usermod -aG qbittorrent torrmedia
 
@@ -17,36 +34,44 @@ TORRMEDIA_ROOT=/var/media/library
 QBIT_URL=http://127.0.0.1:8080
 QBIT_USER=admin
 QBIT_PASS=CHANGE_ME
+
+# TORRMEDIA_TOKEN=
 EOF
 fi
 chown root:torrmedia /etc/torrmedia/config.env
 chmod 0640 /etc/torrmedia/config.env
 
 echo "== 3. binary =="
-install -m 0755 -o root -g root "$SRC/torrmedia" /usr/local/bin/torrmedia
+install -m 0755 -o root -g root "$SRC/$BINARY" /usr/local/bin/torrmedia
 
 echo "== 4. unit + hardening drop-in =="
 install -m 0644 "$SRC/torrmedia.service" /etc/systemd/system/torrmedia.service
 install -d /etc/systemd/system/torrmedia.service.d
 install -m 0644 "$SRC/hardening.conf" /etc/systemd/system/torrmedia.service.d/hardening.conf
 
-echo "== 5. permissions for DELETE: g+w on directories and existing qBit files, UMask 0002 =="
-find /var/media -type d -exec chmod g+w {} +
-# UMask affects only files created after the qBittorrent restart. Retrofit
-# existing media owned by qBittorrent so torrmedia (SupplementaryGroups=
-# qbittorrent) can open the inode O_RDWR for the sparse-trim workflow.
-find /var/media/library -type f \
+echo "== 5. permissions for sparse trim: g+w on the library, UMask 0002 for qBittorrent =="
+TORRMEDIA_ROOT_DIR="$(. /etc/torrmedia/config.env; echo "${TORRMEDIA_ROOT:-/var/media/library}")"
+MEDIA_PARENT="$(dirname "$TORRMEDIA_ROOT_DIR")"
+find "$MEDIA_PARENT" -type d -exec chmod g+w {} +
+find "$TORRMEDIA_ROOT_DIR" -type f \
   -user qbittorrent -group qbittorrent ! -perm -g+w \
   -exec chmod g+w {} +
+
+install -d /etc/systemd/system/qbittorrent.service.d
+QBIT_DROPIN=/etc/systemd/system/qbittorrent.service.d/10-torrmedia.conf
 QBIT_RESTART=0
-if grep -q '^UMask=0022' /etc/systemd/system/qbittorrent.service; then
-  sed -i 's/^UMask=0022/UMask=0002/' /etc/systemd/system/qbittorrent.service
+if ! grep -qs '^UMask=0002' "$QBIT_DROPIN"; then
+  cat > "$QBIT_DROPIN" <<'EOF'
+[Service]
+UMask=0002
+EOF
+  chmod 0644 "$QBIT_DROPIN"
   QBIT_RESTART=1
 fi
 
 systemctl daemon-reload
 if [ "$QBIT_RESTART" = 1 ]; then
-  echo "== restart qbittorrent (UMask changed) =="
+  echo "== restart qbittorrent (UMask drop-in added) =="
   systemctl restart qbittorrent
 fi
 systemctl enable --now torrmedia
@@ -54,5 +79,9 @@ systemctl restart torrmedia
 
 sleep 1
 echo "== status =="
-systemctl --no-pager --lines=5 status torrmedia qbittorrent | grep -E "●|Active:|Main PID" || true
-ss -tln | grep 8091 || echo "WARN: 8091 not listening"
+systemctl --no-pager --lines=5 status torrmedia | grep -E "●|Active:|Main PID" || true
+RUNNING="$(/usr/local/bin/torrmedia --version 2>/dev/null || true)"
+ss -tln | grep -q ":${TORRMEDIA_LISTEN##*:}" || ss -tln | grep 8091 || echo "WARN: port is not listening"
+echo
+echo "Done. No port was opened to the outside: set up the firewall or VPN yourself (see README)."
+echo "Check: curl -fsS http://127.0.0.1:8091/health"
