@@ -222,8 +222,43 @@ func TestListExposesExactOwnership(t *testing.T) {
 		t.Fatalf("item torrent_hash=%q, want %q", got, fake.hash)
 	}
 	file := response.Items[0].Files[0]
-	if file.TorrentHash != fake.hash || file.QbitFileID != 0 {
-		t.Fatalf("file identity=(%q,%d), want (%q,0)", file.TorrentHash, file.QbitFileID, fake.hash)
+	if file.TorrentHash != fake.hash || file.QbitFileID != 0 || file.Owner != ownerTorrent {
+		t.Fatalf("file identity=(%q,%q,%d), want (%q,%q,0)",
+			file.Owner, file.TorrentHash, file.QbitFileID, ownerTorrent, fake.hash)
+	}
+}
+
+func TestListDistinguishesUnownedFileFromAmbiguousOne(t *testing.T) {
+	root := testRoot(t)
+	const size = int64(1 << 20)
+	owned := filepath.Join("shows", "release", "episode.mkv")
+	loose := filepath.Join("movies", "home-video.mkv")
+	writeTestFile(t, filepath.Join(root, owned), size)
+	writeTestFile(t, filepath.Join(root, loose), size)
+
+	fake := oneFileFake(root, filepath.Join("release", "episode.mkv"), size, 1)
+	s := newBatchServer(t, root, fake, time.Millisecond)
+
+	recorder := httptest.NewRecorder()
+	s.handleList(recorder, httptest.NewRequest(http.MethodGet, "/list", nil))
+	var response struct {
+		Items []item `json:"items"`
+	}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil {
+		t.Fatal(err)
+	}
+	owners := map[string]string{}
+	for _, it := range response.Items {
+		for _, f := range it.Files {
+			owners[f.Path] = f.Owner
+		}
+	}
+	if owners[owned] != ownerTorrent {
+		t.Fatalf("owned file owner=%q, want %q", owners[owned], ownerTorrent)
+	}
+	if owners[loose] != ownerNone {
+		t.Fatalf("plain file owner=%q, want %q — the client would refuse to delete it",
+			owners[loose], ownerNone)
 	}
 }
 

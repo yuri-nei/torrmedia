@@ -54,9 +54,16 @@ type fileEntry struct {
 	Watch string `json:"watch,omitempty"`
 	Pos   int64  `json:"pos,omitempty"`
 
+	Owner       string `json:"owner"`
 	TorrentHash string `json:"torrent_hash"`
 	QbitFileID  int    `json:"qbit_file_id"`
 }
+
+const (
+	ownerTorrent   = "torrent"
+	ownerNone      = "none"
+	ownerAmbiguous = "ambiguous"
+)
 
 type item struct {
 	Title       string      `json:"title"`
@@ -203,7 +210,7 @@ func (s *server) collectFiles(dir string) ([]fileEntry, error) {
 func newFileEntry(name, rel string, info os.FileInfo) fileEntry {
 	return fileEntry{
 		Name: name, Path: rel, Size: info.Size(), Mtime: info.ModTime().Unix(),
-		QbitFileID: -1,
+		Owner: ownerNone, QbitFileID: -1,
 	}
 }
 
@@ -308,14 +315,19 @@ func (s *server) enrichOwnership(items []item) ([]item, bool) {
 			if err != nil {
 				continue
 			}
-			owner, found := idx.lookup(abs, info)
-			if found && owner.known() {
+			switch owner, found := idx.lookup(abs, info); {
+			case found && owner.known():
 				if owner.progress < 1 {
 					continue
 				}
+				fe.Owner = ownerTorrent
 				fe.TorrentHash = owner.hash
 				fe.QbitFileID = owner.fileID
 				hashes[owner.hash] = struct{}{}
+			case found:
+				fe.Owner = ownerAmbiguous
+			default:
+				fe.Owner = ownerNone
 			}
 			kept = append(kept, fe)
 		}
