@@ -126,12 +126,11 @@ func TestActiveStreamBlocksDelete(t *testing.T) {
 	}
 
 	rec = env.do(t, http.MethodDelete, "/items/"+item.id+"/files/"+item.files[0].id, "")
-	if rec.Code != http.StatusAccepted {
-		t.Fatalf("status=%d body=%s", rec.Code, rec.Body)
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("status=%d body=%s, want 409", rec.Code, rec.Body)
 	}
-	op := env.awaitOperation(t, decodeJSON[operation](t, rec.Body.Bytes()).ID)
-	if op.State != opFailed {
-		t.Fatalf("delete of a streamed file succeeded: %+v", op)
+	if decodeJSON[apiError](t, rec.Body.Bytes()).Code != codeStreaming {
+		t.Fatalf("body=%s", rec.Body)
 	}
 	after, err := os.ReadFile(target)
 	if err != nil {
@@ -479,6 +478,70 @@ func TestDeleteReservesInodeAgainstLateStream(t *testing.T) {
 	}
 }
 
+func TestStreamRevalidatesFileAfterAcquire(t *testing.T) {
+	env := newTestEnv(t)
+	target := filepath.Join(env.root, "shows", "Release", "e01.mkv")
+	f, err := os.Open(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	before, err := f.Stat()
+	if err != nil || !complete(before) {
+		t.Fatalf("initial file is not complete: info=%+v err=%v", before, err)
+	}
+
+	writer, err := os.OpenFile(target, os.O_WRONLY, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := writer.Truncate(0); err != nil {
+		writer.Close()
+		t.Fatal(err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	release, ok := env.streamReg().acquire(inodeKey(before))
+	if !ok {
+		t.Fatal("completed delete left the inode reserved")
+	}
+	defer release()
+	current, err := f.Stat()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !os.SameFile(before, current) {
+		t.Fatal("test no longer exercises the same inode")
+	}
+	if validStreamInfo(before, current) {
+		t.Fatal("post-acquire validation accepted a file trimmed before acquire")
+	}
+}
+
+func TestDeleteReservesFileBeforeOperationStarts(t *testing.T) {
+	env := newTestEnv(t)
+	_, item := env.firstItem(t)
+	unreserve, free, err := env.reserveDeleteFile(&item.files[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !free {
+		t.Fatal("quiet file could not be reserved for delete")
+	}
+	defer unreserve()
+
+	target := filepath.Join(env.root, "shows", "Release", "e01.mkv")
+	info, err := os.Stat(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := env.streamReg().acquire(inodeKey(info)); ok {
+		t.Fatal("stream acquired an inode reserved before operation start")
+	}
+}
+
 func TestBusyItemDoesNotOfferPlay(t *testing.T) {
 	env := newTestEnv(t)
 	_, item := env.firstItem(t)
@@ -493,4 +556,46 @@ func TestBusyItemDoesNotOfferPlay(t *testing.T) {
 		}
 	}
 	env.ops().succeed(op.ID, nil, nil)
+}
+
+func TestSeveralDeletesOfOneItemBatchTogether(t *testing.T) {
+	env := newTestEnv(t)
+	env.deleteDebounce = 150 * time.Millisecond
+	_, item := env.firstItem(t)
+
+	ops := []string{}
+	for _, f := range item.files {
+		rec := env.do(t, http.MethodDelete, "/items/"+item.id+"/files/"+f.id, "")
+		if rec.Code != http.StatusAccepted {
+			t.Fatalf("delete %q: status=%d body=%s", f.name, rec.Code, rec.Body)
+		}
+		ops = append(ops, decodeJSON[operation](t, rec.Body.Bytes()).ID)
+	}
+	for _, id := range ops {
+		if op := env.awaitOperation(t, id); op.State != opDone {
+			t.Fatalf("operation %s: %+v", id, op)
+		}
+	}
+
+	calls := env.fake.snapshotCalls()
+	counts := map[string]int{}
+	for _, c := range calls {
+		counts[c]++
+	}
+	if counts["prio0:0"] != 1 || counts["prio0:1"] != 1 {
+		t.Fatalf("both files must be excluded exactly once: %v", calls)
+	}
+	if counts["recheck"] != 1 {
+		t.Fatalf("recheck ran %d times, want one for the whole batch: %v", counts["recheck"], calls)
+	}
+
+	for _, name := range []string{"e01.mkv", "e02.mkv"} {
+		info, err := os.Stat(filepath.Join(env.root, "shows", "Release", name))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, ok := env.streamReg().acquire(inodeKey(info)); !ok {
+			t.Fatalf("%s is still reserved after the batch finished", name)
+		}
+	}
 }

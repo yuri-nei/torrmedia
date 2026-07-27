@@ -74,6 +74,11 @@ func availableFilesystemBytes(path string) (int64, error) {
 
 func sortStrings(v []string) { sort.Strings(v) }
 
+func validStreamInfo(before, current os.FileInfo) bool {
+	return before != nil && current != nil &&
+		current.Mode().IsRegular() && os.SameFile(before, current) && complete(current)
+}
+
 func (s *server) handleStream(w http.ResponseWriter, r *http.Request) {
 	cat, item, ok := s.resolveItem(w, r)
 	if !ok {
@@ -105,6 +110,12 @@ func (s *server) handleStream(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer release()
+	current, err := f.Stat()
+	if err != nil || !validStreamInfo(info, current) {
+		writeErr(w, http.StatusConflict, codeBusy, "file changed while the stream was being opened")
+		return
+	}
+	info = current
 
 	ext := strings.ToLower(filepath.Ext(file.name))
 	ct := mediaMime[ext]

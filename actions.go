@@ -178,6 +178,22 @@ func (s *server) runFileDelete(op *operation, item *catalogItem, file *catalogFi
 	return outcome.response, warnings, nil
 }
 
+func (s *server) reserveDeleteFile(file *catalogFile) (release func(), free bool, err error) {
+	abs, ok := s.fileAbs(file)
+	if !ok {
+		return func() {}, true, nil
+	}
+	info, err := os.Stat(abs)
+	if errors.Is(err, os.ErrNotExist) {
+		return func() {}, true, nil
+	}
+	if err != nil {
+		return nil, false, err
+	}
+	release, free = s.streamReg().reserve(inodeKey(info))
+	return release, free, nil
+}
+
 func (s *server) removeShelfFile(file *catalogFile) error {
 	abs, ok := s.fileAbs(file)
 	if !ok {

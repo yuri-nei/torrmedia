@@ -96,7 +96,7 @@ func (s *server) permitFile(cat *catalog, item *catalogItem, file *catalogFile, 
 	if !cat.qbitOK {
 		return deny(http.StatusBadGateway, codeQbitUnavailable, "qbittorrent is unavailable")
 	}
-	if s.operations.busy(item.id) {
+	if action != actionDelete && s.operations.busy(item.id) {
 		return deny(http.StatusConflict, codeBusy, "an operation is already running for this item")
 	}
 	if file.ambiguous {

@@ -269,8 +269,19 @@ func (s *server) handleFileDelete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	itemCopy, fileCopy := *item, *file
+	unreserve, free, err := s.reserveDeleteFile(&fileCopy)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, codeInternal, "reserve file for delete: %v", err)
+		return
+	}
+	if !free {
+		writeErr(w, http.StatusConflict, codeStreaming,
+			"file is being streamed right now; nothing deleted")
+		return
+	}
 	s.startOperation(w, "file.delete", item.id, &fileCopy.id,
 		func(op *operation) (map[string]any, []string, error) {
+			defer unreserve()
 			return s.runFileDelete(op, &itemCopy, &fileCopy)
 		})
 }
