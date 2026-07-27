@@ -219,7 +219,7 @@ func (s *server) runStatePump(done <-chan struct{}) {
 			drain(s.statePoke)
 			s.refreshState()
 		case <-ping.C:
-			s.events.publishPing()
+			s.hub().publishPing()
 		}
 	}
 }
@@ -250,15 +250,15 @@ func (s *server) refreshState() {
 		log.Printf("state: marshal list: %v", err)
 		return
 	}
-	s.events.publishState(topicList, list)
+	s.hub().publishState(topicList, list)
 
-	for _, topic := range s.events.topics() {
+	for _, topic := range s.hub().topics() {
 		if topic == topicList {
 			continue
 		}
 		item := cat.item(topic)
 		if item == nil {
-			s.events.publishState(topic, []byte(`null`))
+			s.hub().publishState(topic, []byte(`null`))
 			continue
 		}
 		detail, err := json.Marshal(s.renderDetail(cat, item))
@@ -266,7 +266,7 @@ func (s *server) refreshState() {
 			log.Printf("state: marshal item %s: %v", topic, err)
 			continue
 		}
-		s.events.publishState(topic, detail)
+		s.hub().publishState(topic, detail)
 	}
 }
 
@@ -284,10 +284,10 @@ func (s *server) serveEvents(w http.ResponseWriter, r *http.Request, topic strin
 	w.WriteHeader(http.StatusOK)
 	flusher.Flush()
 
-	sub := s.events.subscribe(topic)
-	defer s.events.unsubscribe(sub)
+	sub := s.hub().subscribe(topic)
+	defer s.hub().unsubscribe(sub)
 
-	if data, ok := s.events.snapshotFor(topic); ok {
+	if data, ok := s.hub().snapshotFor(topic); ok {
 		writeSSE(w, sseFrame{event: eventState, data: data})
 		flusher.Flush()
 	} else {
@@ -328,6 +328,6 @@ func (s *server) publishOperation(op operation) {
 		log.Printf("operation %s: marshal: %v", op.ID, err)
 		return
 	}
-	s.events.publishOperationFrame(op.Item, data)
+	s.hub().publishOperationFrame(op.Item, data)
 	s.poke()
 }

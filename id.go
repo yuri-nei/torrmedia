@@ -49,15 +49,3 @@ func parseID(raw string) (objectID, error) {
 func fileID(relWithinItem string) string {
 	return base64.RawURLEncoding.EncodeToString([]byte(filepath.ToSlash(relWithinItem)))
 }
-
-func parseFileID(raw string) (string, error) {
-	value, err := base64.RawURLEncoding.DecodeString(raw)
-	if err != nil || len(value) == 0 || strings.ContainsRune(string(value), 0) {
-		return "", errBadID
-	}
-	rel := filepath.ToSlash(filepath.Clean(string(value)))
-	if rel == "." || rel == ".." || strings.HasPrefix(rel, "../") || strings.HasPrefix(rel, "/") {
-		return "", errBadID
-	}
-	return rel, nil
-}

@@ -9,18 +9,16 @@ import (
 )
 
 const (
-	codeBadRequest          = "bad_request"
-	codeUnauthorized        = "unauthorized"
-	codeRefused             = "refused"
-	codeNotFound            = "not_found"
-	codeAmbiguous           = "ambiguous"
-	codeBusy                = "busy"
-	codeStreaming           = "streaming"
-	codeInsufficientStorage = "insufficient_storage"
-	codeQbitUnavailable     = "qbittorrent_unavailable"
-	codeDeadline            = "deadline"
-	codeInternal            = "internal"
-	codeUnavailable         = "unavailable"
+	codeBadRequest      = "bad_request"
+	codeUnauthorized    = "unauthorized"
+	codeRefused         = "refused"
+	codeNotFound        = "not_found"
+	codeAmbiguous       = "ambiguous"
+	codeBusy            = "busy"
+	codeStreaming       = "streaming"
+	codeQbitUnavailable = "qbittorrent_unavailable"
+	codeInternal        = "internal"
+	codeUnavailable     = "unavailable"
 )
 
 type apiError struct {

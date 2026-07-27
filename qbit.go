@@ -28,25 +28,18 @@ type qbTorrent struct {
 	Progress     float64 `json:"progress"`
 	AmountLeft   int64   `json:"amount_left"`
 	NumSeeds     int     `json:"num_seeds"`
-	NumComplete  int     `json:"num_complete"`
-	Availability float64 `json:"availability"`
 	DownloadPath string  `json:"download_path"`
 	Category     string  `json:"category"`
 	Size         int64   `json:"size"`
-	ForceStart   bool    `json:"force_start"`
 
-	MagnetURI     string  `json:"magnet_uri"`
-	DlSpeed       int64   `json:"dlspeed"`
-	UpSpeed       int64   `json:"upspeed"`
-	ETA           int64   `json:"eta"`
-	Ratio         float64 `json:"ratio"`
-	Downloaded    int64   `json:"downloaded"`
-	Uploaded      int64   `json:"uploaded"`
-	Completed     int64   `json:"completed"`
-	NumLeechs     int     `json:"num_leechs"`
-	NumIncomplete int     `json:"num_incomplete"`
-	AddedOn       int64   `json:"added_on"`
-	CompletionOn  int64   `json:"completion_on"`
+	MagnetURI string  `json:"magnet_uri"`
+	DlSpeed   int64   `json:"dlspeed"`
+	UpSpeed   int64   `json:"upspeed"`
+	ETA       int64   `json:"eta"`
+	Ratio     float64 `json:"ratio"`
+	Completed int64   `json:"completed"`
+	NumLeechs int     `json:"num_leechs"`
+	AddedOn   int64   `json:"added_on"`
 }
 
 type qbCategory struct {

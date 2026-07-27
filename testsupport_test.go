@@ -101,7 +101,7 @@ func (f *fakeQbit) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				ContentPath: filepath.Join(t.savePath, t.name), State: t.state,
 				Category: t.category, MagnetURI: t.magnet, Size: size,
 				Completed: completed, Progress: 1, AddedOn: 1700000000,
-				NumSeeds: 1, NumComplete: 2, ETA: 8640000,
+				NumSeeds: 1, ETA: 8640000,
 			})
 		}
 		json.NewEncoder(w).Encode(out)

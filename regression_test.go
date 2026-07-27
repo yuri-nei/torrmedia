@@ -305,18 +305,14 @@ func TestIDRoundTrip(t *testing.T) {
 		if err != nil || parsed.kind != idPath || parsed.value != value {
 			t.Fatalf("parseID(%q)=%+v, %v", id, parsed, err)
 		}
-		back, err := parseFileID(fileID(value))
-		if err != nil || back != value {
-			t.Fatalf("file id round trip for %q: %q, %v", value, back, err)
+		if id := fileID(value); strings.ContainsAny(id, "/?&# %+") {
+			t.Fatalf("file id %q contains characters that need escaping", id)
 		}
 	}
 	for _, bad := range []string{"", "x", "p:", "p:!!!", "q:YWJj", "YWJj"} {
 		if _, err := parseID(bad); err == nil {
 			t.Fatalf("parseID(%q) accepted a malformed id", bad)
 		}
-	}
-	if _, err := parseFileID(fileID("../escape")); err == nil {
-		t.Fatal("file id escaping the item was accepted")
 	}
 }
 
