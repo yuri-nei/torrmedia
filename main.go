@@ -94,6 +94,9 @@ type server struct {
 	viewed   *viewedStore
 	playback playbackConfig
 
+	torrentDir  string
+	allowURLAdd bool
+
 	draining atomic.Bool
 	inflight sync.WaitGroup
 	probe    qbitProbe
@@ -133,7 +136,7 @@ func (s *server) fsRoot() *os.Root {
 	return s.osRoot
 }
 
-const version = "2026-07-27.1"
+const version = "2026-07-27.2"
 
 var errBadPath = errors.New("bad path")
 
@@ -154,6 +157,8 @@ func (s *server) resolve(rel string) (string, error) {
 	}
 	return real, nil
 }
+
+func sortStrings(v []string) { sort.Strings(v) }
 
 func hidden(name string) bool { return strings.HasPrefix(name, ".") }
 
@@ -1384,60 +1389,6 @@ func (s *server) torrentFor(w http.ResponseWriter, r *http.Request) (*qbTorrent,
 	return t, true
 }
 
-func (s *server) handleTorrents(w http.ResponseWriter, r *http.Request) {
-	if s.qb == nil {
-		writeErr(w, http.StatusNotImplemented, "qbittorrent is not configured")
-		return
-	}
-	var torrents []qbTorrent
-	if err := s.qb.getJSON("/api/v2/torrents/info", &torrents); err != nil {
-		writeErr(w, http.StatusBadGateway, "qbittorrent: %v", err)
-		return
-	}
-	writeJSON(w, http.StatusOK, map[string]any{"torrents": torrents})
-}
-
-func (s *server) handleTorrent(w http.ResponseWriter, r *http.Request) {
-	t, ok := s.torrentFor(w, r)
-	if !ok {
-		return
-	}
-	files, err := s.qb.files(t.Hash)
-	if err != nil {
-		writeErr(w, http.StatusBadGateway, "qbittorrent files: %v", err)
-		return
-	}
-	out := make([]map[string]any, 0, len(files))
-	for _, f := range files {
-		abs := filepath.Join(t.SavePath, f.Name)
-		entry := map[string]any{
-			"name": f.Name, "size": f.Size,
-			"priority": f.Priority, "progress": f.Progress,
-			"on_disk": false,
-		}
-		if info, err := os.Stat(abs); err == nil {
-			entry["on_disk"] = true
-			entry["complete_on_disk"] = complete(info)
-			if st, ok := info.Sys().(*syscall.Stat_t); ok {
-				entry["allocated"] = st.Blocks * 512
-			}
-		}
-		out = append(out, entry)
-	}
-	var trackers []map[string]any
-	s.qb.getJSON("/api/v2/torrents/trackers?hash="+url.QueryEscape(t.Hash), &trackers)
-	urls := []string{}
-	for _, tr := range trackers {
-		if u, ok := tr["url"].(string); ok && strings.HasPrefix(u, "http") || strings.HasPrefix(fmt.Sprint(tr["url"]), "udp") {
-			urls = append(urls, fmt.Sprint(tr["url"]))
-		}
-	}
-	writeJSON(w, http.StatusOK, map[string]any{
-		"hash": t.Hash, "name": t.Name, "state": t.State,
-		"progress": t.Progress, "files": out, "trackers": urls,
-	})
-}
-
 func (s *server) guardTorrentMutation(w http.ResponseWriter, hash string) (func(), bool) {
 	if s.draining.Load() {
 		writeErr(w, http.StatusServiceUnavailable, "torrmedia is shutting down")
@@ -1464,6 +1415,12 @@ func (s *server) handleStartStop(action string) http.HandlerFunc {
 			return
 		}
 		defer unlock()
+		warnings := []string{}
+		if action == "stop" && t.ForceStart {
+			if err := s.qb.setForceStart(t.Hash, false); err != nil {
+				warnings = append(warnings, fmt.Sprintf("force start was not cleared: %v", err))
+			}
+		}
 		legacy := map[string]string{"start": "resume", "stop": "pause"}[action]
 		err := s.qb.postOK("/api/v2/torrents/"+action, url.Values{"hashes": {t.Hash}})
 		if err != nil && legacy != "" {
@@ -1474,7 +1431,9 @@ func (s *server) handleStartStop(action string) http.HandlerFunc {
 			return
 		}
 		log.Printf("%s %s (%s): ok", action, t.Hash, t.Name)
-		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "hash": t.Hash, action: "ok"})
+		writeJSON(w, http.StatusOK, map[string]any{
+			"ok": true, "hash": t.Hash, action: "ok", "warnings": warnings,
+		})
 	}
 }
 
@@ -1501,17 +1460,38 @@ func (s *server) handleRemove(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	deleteFiles, err := parseDeleteFiles(r)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, "%v", err)
+		return
+	}
 	unlock, ok := s.guardTorrentMutation(w, t.Hash)
 	if !ok {
 		return
 	}
 	defer unlock()
-	if err := s.qb.deleteTorrent(t.Hash, false); err != nil {
+	if deleteFiles {
+		streamed, err := s.streamedFileOf(t)
+		if err != nil {
+			writeErr(w, http.StatusBadGateway, "qbittorrent files: %v", err)
+			return
+		}
+		if streamed != "" {
+			writeErr(w, http.StatusConflict,
+				"file %q is being streamed right now; nothing removed", streamed)
+			return
+		}
+	}
+	if err := s.qb.deleteTorrent(t.Hash, deleteFiles); err != nil {
 		writeErr(w, http.StatusBadGateway, "qbittorrent delete: %v", err)
 		return
 	}
-	log.Printf("remove %s (%s): torrent dropped, files kept", t.Hash, t.Name)
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "hash": t.Hash, "removed": true, "files_kept": true})
+	log.Printf("remove %s (%s): torrent dropped, delete_files=%t", t.Hash, t.Name, deleteFiles)
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok": true, "hash": t.Hash, "removed": true,
+		"files_deleted": deleteFiles, "files_kept": !deleteFiles,
+		"warnings": []string{},
+	})
 }
 
 func (s *server) handlePrio(w http.ResponseWriter, r *http.Request) {
@@ -1572,18 +1552,22 @@ func (s *server) handleAdd(w http.ResponseWriter, r *http.Request) {
 	}
 	var err error
 	if name := q.Get("file"); name != "" {
-		if strings.ContainsAny(name, "/\\") {
-			writeErr(w, http.StatusBadRequest, "file must be a bare name inside /etc/torrmedia")
+		if strings.ContainsAny(name, "/\\") || strings.HasPrefix(name, ".") {
+			writeErr(w, http.StatusBadRequest, "file must be a bare name inside %s", s.torrentDir)
 			return
 		}
 		var data []byte
-		if data, err = os.ReadFile(filepath.Join("/etc/torrmedia", name)); err != nil {
+		if data, err = os.ReadFile(filepath.Join(s.torrentDir, name)); err != nil {
 			writeErr(w, http.StatusBadRequest, "read %s: %v", name, err)
 			return
 		}
 		err = s.qb.addTorrentFile(name, data, fields)
-	} else if m := q.Get("magnet"); m != "" {
-		fields["urls"] = m
+	} else if link := q.Get("magnet"); link != "" {
+		if err := s.checkAddLink(link); err != nil {
+			writeErr(w, http.StatusBadRequest, "%v", err)
+			return
+		}
+		fields["urls"] = link
 		form := url.Values{}
 		for k, v := range fields {
 			form.Set(k, v)
@@ -1627,6 +1611,14 @@ type qbTorrent struct {
 	NumComplete  int     `json:"num_complete"`
 	Availability float64 `json:"availability"`
 	DownloadPath string  `json:"download_path"`
+	Category     string  `json:"category"`
+	Size         int64   `json:"size"`
+	ForceStart   bool    `json:"force_start"`
+}
+
+type qbCategory struct {
+	Name     string `json:"name"`
+	SavePath string `json:"savePath"`
 }
 
 type qbFile struct {
@@ -2139,9 +2131,9 @@ func (s *server) routes() http.Handler {
 	})
 	mux.HandleFunc("/file/enable", onlyMethod(http.MethodPost, s.handleEnable))
 	mux.HandleFunc("/viewed", s.handleViewed)
-	// Service endpoints, outside docs/09:
 	mux.HandleFunc("/torrent", onlyMethod(http.MethodGet, s.handleTorrent))
 	mux.HandleFunc("/torrents", onlyMethod(http.MethodGet, s.handleTorrents))
+	mux.HandleFunc("/categories", onlyMethod(http.MethodGet, s.handleCategories))
 	mux.HandleFunc("/recheck", onlyMethod(http.MethodPost, s.handleRecheck))
 	mux.HandleFunc("/start", onlyMethod(http.MethodPost, s.handleStartStop("start")))
 	mux.HandleFunc("/stop", onlyMethod(http.MethodPost, s.handleStartStop("stop")))
@@ -2174,6 +2166,8 @@ func main() {
 		playback:         defaultPlaybackConfig(),
 		locks:            newLockTable(),
 		streams:          newStreamRegistry(),
+		torrentDir:       envOr("TORRMEDIA_TORRENT_DIR", "/etc/torrmedia/torrents"),
+		allowURLAdd:      os.Getenv("TORRMEDIA_ALLOW_URL_ADD") == "true",
 	}
 	if err := parsePlaybackConfig(&s.playback); err != nil {
 		log.Fatal(err)
