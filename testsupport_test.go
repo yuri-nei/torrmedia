@@ -276,7 +276,7 @@ func (e *testEnv) awaitOperation(t *testing.T, id string) operation {
 		if !ok {
 			t.Fatalf("operation %s disappeared", id)
 		}
-		if op.State == opDone || op.State == opFailed {
+		if op.State == opDone || op.State == opFailed || op.State == opCancelled {
 			return op
 		}
 		if time.Now().After(deadline) {

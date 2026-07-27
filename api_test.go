@@ -5,7 +5,6 @@ import (
 	"net/http"
 	"strings"
 	"testing"
-	"time"
 )
 
 func decodeJSON[T any](t *testing.T, body []byte) T {
@@ -245,18 +244,13 @@ func TestAddOperationIsVisibleInTheListStream(t *testing.T) {
 	}
 	env.awaitOperation(t, op.ID)
 
-	deadline := time.After(2 * time.Second)
-	for {
-		select {
-		case frame := <-sub.ch:
-			if frame.event != eventOperation {
-				continue
-			}
-			if got := decodeJSON[operation](t, frame.data); got.ID == op.ID {
-				return
-			}
-		case <-deadline:
-			t.Fatal("add operation never appeared in the list stream")
+	for _, frame := range sub.drain() {
+		if frame.event != eventOperation {
+			continue
+		}
+		if got := decodeJSON[operation](t, frame.data); got.ID == op.ID {
+			return
 		}
 	}
+	t.Fatal("add operation never appeared in the list stream")
 }

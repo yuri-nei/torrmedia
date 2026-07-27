@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"net/http"
 	"strconv"
 	"strings"
@@ -12,6 +13,7 @@ func (s *server) routes() http.Handler {
 	mux.HandleFunc("GET /health", s.handleHealth)
 	mux.HandleFunc("GET /categories", s.handleCategories)
 	mux.HandleFunc("GET /operations/{op}", s.handleOperation)
+	mux.HandleFunc("DELETE /operations/{op}", s.handleOperationCancel)
 
 	mux.HandleFunc("GET /events", func(w http.ResponseWriter, r *http.Request) {
 		s.serveEvents(w, r, topicList)
@@ -165,6 +167,18 @@ func (s *server) handleOperation(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, op)
+}
+
+func (s *server) handleOperationCancel(w http.ResponseWriter, r *http.Request) {
+	switch err := s.ops().requestCancel(r.PathValue("op")); {
+	case err == nil:
+		s.poke()
+		writeNoContent(w)
+	case errors.Is(err, errNoSuchOperation):
+		writeErr(w, http.StatusNotFound, codeNotFound, "%v", err)
+	default:
+		writeErr(w, http.StatusConflict, codeBusy, "%v", err)
+	}
 }
 
 func (s *server) itemCommand(action string) http.HandlerFunc {
@@ -326,12 +340,12 @@ func (s *server) handleFileViewedClear(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *server) handleItemViewedClear(w http.ResponseWriter, r *http.Request) {
-	_, item, ok := s.resolveItem(w, r)
+	cat, item, ok := s.resolveItem(w, r)
 	if !ok {
 		return
 	}
-	if item.shelfRel == "" {
-		writeErr(w, http.StatusConflict, codeNotFound, "item is not on the shelf")
+	if d := s.permitItem(cat, item, actionClearViewed); d != nil {
+		writeDenial(w, d)
 		return
 	}
 	if err := s.clearViewedItem(item.shelfRel); err != nil {

@@ -99,7 +99,12 @@ func (s *server) handleStream(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusNotFound, codeNotFound, "not a complete regular file")
 		return
 	}
-	defer s.streamReg().acquire(inodeKey(info))()
+	release, ok := s.streamReg().acquire(inodeKey(info))
+	if !ok {
+		writeErr(w, http.StatusConflict, codeBusy, "file is being deleted right now")
+		return
+	}
+	defer release()
 
 	ext := strings.ToLower(filepath.Ext(file.name))
 	ct := mediaMime[ext]

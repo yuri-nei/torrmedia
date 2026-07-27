@@ -142,13 +142,56 @@ func TestCatalogMarksAmbiguousItems(t *testing.T) {
 	env.fake.mu.Unlock()
 
 	cat := env.buildCatalog()
+	env.catalog.Store(cat)
 	if len(cat.items) != 1 {
 		t.Fatalf("items=%d, want one ambiguous item", len(cat.items))
 	}
 	detail := env.renderDetail(cat, cat.items[0])
+	if len(detail.Actions) != 0 {
+		t.Fatalf("ambiguous item still offers %v", detail.Actions)
+	}
 	for _, f := range detail.Files {
-		if contains(f.Actions, actionDelete) {
-			t.Fatalf("ambiguous file still offers delete: %+v", f)
+		if contains(f.Actions, actionDelete) || contains(f.Actions, actionEnable) {
+			t.Fatalf("ambiguous file still offers a destructive action: %+v", f)
+		}
+	}
+}
+
+func TestCatalogDetectsSharedFileAcrossDifferentItems(t *testing.T) {
+	env := newTestEnv(t)
+	const size = int64(1 << 20)
+	shared := filepath.Join("Release", "e01.mkv")
+
+	env.fake.mu.Lock()
+	env.fake.torrents = append(env.fake.torrents, &fakeTorrent{
+		hash: "abcdefabcdefabcdefabcdefabcdefabcdefabcd", name: "Other",
+		savePath: env.fake.torrents[0].savePath, state: "stoppedUP",
+		files: []fakeFile{{name: shared, size: size, priority: 1, progress: 1}},
+	})
+	env.fake.mu.Unlock()
+
+	cat := env.buildCatalog()
+	env.catalog.Store(cat)
+	if len(cat.items) != 2 {
+		t.Fatalf("items=%d, want two distinct ids", len(cat.items))
+	}
+	for _, item := range cat.items {
+		if !item.ambiguous {
+			t.Fatalf("item %q sharing a file is not marked ambiguous", item.title)
+		}
+		if actions := env.itemActionList(cat, item); len(actions) != 0 {
+			t.Fatalf("item %q sharing a file offers %v", item.title, actions)
+		}
+		for i := range item.files {
+			if item.files[i].rel != "e01.mkv" {
+				continue
+			}
+			if !item.files[i].ambiguous {
+				t.Fatalf("shared file in %q is not marked ambiguous", item.title)
+			}
+			if contains(env.fileActionList(cat, item, &item.files[i]), actionDelete) {
+				t.Fatalf("shared file in %q still offers delete", item.title)
+			}
 		}
 	}
 }

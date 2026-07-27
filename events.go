@@ -24,7 +24,82 @@ type sseFrame struct {
 
 type eventSub struct {
 	topic string
-	ch    chan sseFrame
+
+	mu      sync.Mutex
+	state   []byte
+	ops     [][]byte
+	pings   int
+	closed  bool
+	wake    chan struct{}
+	maxOps  int
+	dropped bool
+}
+
+func newEventSub(topic string) *eventSub {
+	return &eventSub{topic: topic, wake: make(chan struct{}, 1), maxOps: 256}
+}
+
+func (s *eventSub) signal() {
+	select {
+	case s.wake <- struct{}{}:
+	default:
+	}
+}
+
+func (s *eventSub) pushState(data []byte) {
+	s.mu.Lock()
+	if !s.closed {
+		s.state = data
+	}
+	s.mu.Unlock()
+	s.signal()
+}
+
+func (s *eventSub) pushOperation(data []byte) {
+	s.mu.Lock()
+	if !s.closed {
+		if len(s.ops) >= s.maxOps {
+			s.ops = s.ops[1:]
+			s.dropped = true
+		}
+		s.ops = append(s.ops, data)
+	}
+	s.mu.Unlock()
+	s.signal()
+}
+
+func (s *eventSub) pushPing() {
+	s.mu.Lock()
+	if !s.closed {
+		s.pings++
+	}
+	s.mu.Unlock()
+	s.signal()
+}
+
+func (s *eventSub) drain() (frames []sseFrame) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.state != nil {
+		frames = append(frames, sseFrame{event: eventState, data: s.state})
+		s.state = nil
+	}
+	for _, op := range s.ops {
+		frames = append(frames, sseFrame{event: eventOperation, data: op})
+	}
+	s.ops = nil
+	if s.pings > 0 {
+		frames = append(frames, sseFrame{event: eventPing, data: []byte("{}")})
+		s.pings = 0
+	}
+	return frames
+}
+
+func (s *eventSub) close() {
+	s.mu.Lock()
+	s.closed = true
+	s.mu.Unlock()
+	s.signal()
 }
 
 type eventHub struct {
@@ -38,7 +113,7 @@ func newEventHub() *eventHub {
 }
 
 func (h *eventHub) subscribe(topic string) *eventSub {
-	sub := &eventSub{topic: topic, ch: make(chan sseFrame, 8)}
+	sub := newEventSub(topic)
 	h.mu.Lock()
 	h.subs[sub] = struct{}{}
 	h.mu.Unlock()
@@ -52,7 +127,7 @@ func (h *eventHub) unsubscribe(sub *eventSub) {
 		delete(h.last, sub.topic)
 	}
 	h.mu.Unlock()
-	close(sub.ch)
+	sub.close()
 }
 
 func (h *eventHub) hasTopicLocked(topic string) bool {
@@ -78,17 +153,17 @@ func (h *eventHub) topics() []string {
 	return out
 }
 
-func (h *eventHub) publish(topic string, frame sseFrame) {
+func (h *eventHub) forEach(topic string, fn func(*eventSub)) {
 	h.mu.Lock()
-	defer h.mu.Unlock()
+	subs := make([]*eventSub, 0, len(h.subs))
 	for sub := range h.subs {
-		if sub.topic != topic {
-			continue
+		if sub.topic == topic {
+			subs = append(subs, sub)
 		}
-		select {
-		case sub.ch <- frame:
-		default:
-		}
+	}
+	h.mu.Unlock()
+	for _, sub := range subs {
+		fn(sub)
 	}
 }
 
@@ -101,7 +176,23 @@ func (h *eventHub) publishState(topic string, data []byte) {
 	}
 	h.mu.Unlock()
 	if changed {
-		h.publish(topic, sseFrame{event: eventState, data: data})
+		h.forEach(topic, func(sub *eventSub) { sub.pushState(data) })
+	}
+}
+
+func (h *eventHub) publishOperationFrame(topic string, data []byte) {
+	h.forEach(topic, func(sub *eventSub) { sub.pushOperation(data) })
+}
+
+func (h *eventHub) publishPing() {
+	h.mu.Lock()
+	subs := make([]*eventSub, 0, len(h.subs))
+	for sub := range h.subs {
+		subs = append(subs, sub)
+	}
+	h.mu.Unlock()
+	for _, sub := range subs {
+		sub.pushPing()
 	}
 }
 
@@ -130,9 +221,7 @@ func (s *server) runStatePump(done <-chan struct{}) {
 			drain(s.statePoke)
 			s.refreshState()
 		case <-ping.C:
-			for _, topic := range s.events.topics() {
-				s.events.publish(topic, sseFrame{event: eventPing, data: []byte("{}")})
-			}
+			s.events.publishPing()
 		}
 	}
 }
@@ -211,12 +300,20 @@ func (s *server) serveEvents(w http.ResponseWriter, r *http.Request, topic strin
 		select {
 		case <-r.Context().Done():
 			return
-		case frame, open := <-sub.ch:
-			if !open {
+		case <-sub.wake:
+			frames := sub.drain()
+			for _, frame := range frames {
+				writeSSE(w, frame)
+			}
+			if len(frames) > 0 {
+				flusher.Flush()
+			}
+			sub.mu.Lock()
+			closed := sub.closed
+			sub.mu.Unlock()
+			if closed {
 				return
 			}
-			writeSSE(w, frame)
-			flusher.Flush()
 		}
 	}
 }
@@ -233,6 +330,6 @@ func (s *server) publishOperation(op operation) {
 		log.Printf("operation %s: marshal: %v", op.ID, err)
 		return
 	}
-	s.events.publish(op.Item, sseFrame{event: eventOperation, data: data})
+	s.events.publishOperationFrame(op.Item, data)
 	s.poke()
 }

@@ -15,6 +15,7 @@ func deny(status int, code, reason string) *denial {
 var (
 	itemActionOrder = []string{
 		actionStart, actionStop, actionRecheck, actionRemove, actionRemoveWithData,
+		actionClearViewed,
 	}
 	fileActionOrder = []string{
 		actionPlay, actionDelete, actionEnable, actionSetViewed, actionClearViewed,
@@ -22,8 +23,23 @@ var (
 )
 
 func (s *server) permitItem(cat *catalog, item *catalogItem, action string) *denial {
+	if action == actionClearViewed {
+		if item.shelfRel == "" {
+			return deny(http.StatusConflict, codeNotFound, "item is not on the shelf")
+		}
+		for i := range item.files {
+			if item.files[i].watch != "" {
+				return nil
+			}
+		}
+		return deny(http.StatusConflict, codeBadRequest, "item has no watch marks")
+	}
 	if !cat.qbitOK {
 		return deny(http.StatusBadGateway, codeQbitUnavailable, "qbittorrent is unavailable")
+	}
+	if item.ambiguous {
+		return deny(http.StatusConflict, codeAmbiguous,
+			"this item shares files with another torrent; refusing to act on it")
 	}
 	if s.operations.busy(item.id) {
 		return deny(http.StatusConflict, codeBusy, "an operation is already running for this item")
@@ -57,6 +73,9 @@ func (s *server) permitFile(cat *catalog, item *catalogItem, file *catalogFile, 
 	case actionPlay:
 		if file.status != fileReady {
 			return deny(http.StatusConflict, codeNotFound, "file is not fully downloaded")
+		}
+		if s.operations.busy(item.id) {
+			return deny(http.StatusConflict, codeBusy, "an operation is running for this item")
 		}
 		return nil
 	case actionSetViewed:

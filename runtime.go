@@ -23,21 +23,25 @@ func inodeKey(info os.FileInfo) string {
 }
 
 type streamRegistry struct {
-	mu sync.Mutex
-	n  map[string]int
+	mu       sync.Mutex
+	n        map[string]int
+	reserved map[string]int
 }
 
 func newStreamRegistry() *streamRegistry {
-	return &streamRegistry{n: make(map[string]int)}
+	return &streamRegistry{n: map[string]int{}, reserved: map[string]int{}}
 }
 
-func (r *streamRegistry) acquire(key string) func() {
+func (r *streamRegistry) acquire(key string) (release func(), ok bool) {
 	if key == "" {
-		return func() {}
+		return func() {}, true
 	}
 	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.reserved[key] > 0 {
+		return nil, false
+	}
 	r.n[key]++
-	r.mu.Unlock()
 	return func() {
 		r.mu.Lock()
 		if r.n[key] <= 1 {
@@ -46,7 +50,28 @@ func (r *streamRegistry) acquire(key string) func() {
 			r.n[key]--
 		}
 		r.mu.Unlock()
+	}, true
+}
+
+func (r *streamRegistry) reserve(key string) (release func(), ok bool) {
+	if key == "" {
+		return func() {}, true
 	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.n[key] > 0 {
+		return nil, false
+	}
+	r.reserved[key]++
+	return func() {
+		r.mu.Lock()
+		if r.reserved[key] <= 1 {
+			delete(r.reserved, key)
+		} else {
+			r.reserved[key]--
+		}
+		r.mu.Unlock()
+	}, true
 }
 
 func (r *streamRegistry) active(key string) bool {

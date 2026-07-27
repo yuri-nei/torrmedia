@@ -31,6 +31,8 @@ type catalogFile struct {
 }
 
 type catalogItem struct {
+	ambiguous bool
+
 	id       string
 	title    string
 	shelfRel string
@@ -48,6 +50,51 @@ type catalogItem struct {
 }
 
 func (c *catalogItem) torrentBacked() bool { return c.hash != "" }
+
+type ownerKey struct {
+	hash  string
+	index int
+}
+
+type ownershipIndex struct {
+	byPath  map[string][]ownerKey
+	byInode map[string][]ownerKey
+}
+
+func newOwnershipIndex() *ownershipIndex {
+	return &ownershipIndex{byPath: map[string][]ownerKey{}, byInode: map[string][]ownerKey{}}
+}
+
+func (idx *ownershipIndex) add(abs string, owner ownerKey) {
+	key := filepath.Clean(abs)
+	idx.byPath[key] = appendOwner(idx.byPath[key], owner)
+	if info, err := os.Stat(abs); err == nil {
+		if ino := inodeKey(info); ino != "" {
+			idx.byInode[ino] = appendOwner(idx.byInode[ino], owner)
+		}
+	}
+}
+
+func appendOwner(owners []ownerKey, owner ownerKey) []ownerKey {
+	for _, existing := range owners {
+		if existing == owner {
+			return owners
+		}
+	}
+	return append(owners, owner)
+}
+
+func (idx *ownershipIndex) contested(abs string) bool {
+	if len(idx.byPath[filepath.Clean(abs)]) > 1 {
+		return true
+	}
+	if info, err := os.Stat(abs); err == nil {
+		if ino := inodeKey(info); ino != "" && len(idx.byInode[ino]) > 1 {
+			return true
+		}
+	}
+	return false
+}
 
 type catalog struct {
 	items    []*catalogItem
@@ -97,9 +144,26 @@ func (s *server) buildCatalog() *catalog {
 		cat.qbitOK = false
 		cat.degraded = "qbittorrent is unavailable: " + err.Error()
 	}
+	owners := newOwnershipIndex()
+	for i := range torrents {
+		t := &torrents[i]
+		for j := range t.files {
+			f := &t.files[j]
+			if t.SavePath == "" || f.Name == "" || filepath.IsAbs(f.Name) {
+				continue
+			}
+			index := j
+			if f.Index != nil {
+				index = *f.Index
+			}
+			owners.add(filepath.Join(t.SavePath, filepath.FromSlash(f.Name)),
+				ownerKey{hash: t.Hash, index: index})
+		}
+	}
+
 	claimed := map[string]bool{}
 	for i := range torrents {
-		item := s.itemFromTorrent(&torrents[i])
+		item := s.itemFromTorrent(&torrents[i], owners)
 		if existing, clash := cat.byID[item.id]; clash {
 			markAmbiguous(existing)
 			markAmbiguous(item)
@@ -129,13 +193,14 @@ func (s *server) buildCatalog() *catalog {
 }
 
 func markAmbiguous(item *catalogItem) {
+	item.ambiguous = true
 	item.status = statusError
 	for i := range item.files {
 		item.files[i].ambiguous = true
 	}
 }
 
-func (s *server) itemFromTorrent(t *qbTorrentSnapshot) *catalogItem {
+func (s *server) itemFromTorrent(t *qbTorrentSnapshot, owners *ownershipIndex) *catalogItem {
 	contentAbs := t.ContentPath
 	if contentAbs == "" {
 		contentAbs = filepath.Join(t.SavePath, t.Name)
@@ -183,10 +248,14 @@ func (s *server) itemFromTorrent(t *qbTorrentSnapshot) *catalogItem {
 		if f.Priority == 0 {
 			status = fileSkipped
 		}
+		contested := owners.contested(abs)
+		if contested {
+			item.ambiguous = true
+		}
 		item.files = append(item.files, catalogFile{
 			id: fileID(within), name: filepath.Base(within), rel: within,
 			shelfRel: fileShelfRel, size: f.Size, progress: f.Progress,
-			status: status, qbitIndex: index,
+			status: status, qbitIndex: index, ambiguous: contested,
 		})
 	}
 	sort.Slice(item.files, func(i, j int) bool { return item.files[i].rel < item.files[j].rel })

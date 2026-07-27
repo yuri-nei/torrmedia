@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -86,23 +87,58 @@ func TestEventsPublishOnlyOnChange(t *testing.T) {
 	defer env.hub().unsubscribe(sub)
 
 	env.refreshState()
-	select {
-	case frame := <-sub.ch:
-		t.Fatalf("unchanged state was published: %s %s", frame.event, frame.data)
-	case <-time.After(50 * time.Millisecond):
+	if frames := sub.drain(); len(frames) != 0 {
+		t.Fatalf("unchanged state was published: %+v", frames)
 	}
 
 	env.fake.mu.Lock()
 	env.fake.torrents[0].state = "uploading"
 	env.fake.mu.Unlock()
 	env.refreshState()
-	select {
-	case frame := <-sub.ch:
-		if frame.event != eventState || !strings.Contains(string(frame.data), statusSeeding) {
-			t.Fatalf("frame=%s %s", frame.event, frame.data)
-		}
-	case <-time.After(time.Second):
-		t.Fatal("changed state was not published")
+	frames := sub.drain()
+	if len(frames) != 1 || frames[0].event != eventState ||
+		!strings.Contains(string(frames[0].data), statusSeeding) {
+		t.Fatalf("frames=%+v", frames)
+	}
+}
+
+func TestStateFrameIsNeverLost(t *testing.T) {
+	hub := newEventHub()
+	sub := hub.subscribe(topicList)
+	defer hub.unsubscribe(sub)
+
+	for i := 0; i < 1000; i++ {
+		hub.publishState(topicList, []byte(`{"n":`+strconv.Itoa(i)+`}`))
+	}
+	frames := sub.drain()
+	if len(frames) != 1 {
+		t.Fatalf("state frames=%d, want exactly the newest one", len(frames))
+	}
+	if got := string(frames[0].data); got != `{"n":999}` {
+		t.Fatalf("state=%s, want the newest", got)
+	}
+
+	hub.publishState(topicList, []byte(`{"n":1000}`))
+	frames = sub.drain()
+	if len(frames) != 1 || string(frames[0].data) != `{"n":1000}` {
+		t.Fatalf("frames=%+v", frames)
+	}
+}
+
+func TestOperationFramesAreQueued(t *testing.T) {
+	hub := newEventHub()
+	sub := hub.subscribe("item-1")
+	defer hub.unsubscribe(sub)
+
+	for i := 0; i < 5; i++ {
+		hub.publishOperationFrame("item-1", []byte(`{"i":`+strconv.Itoa(i)+`}`))
+	}
+	frames := sub.drain()
+	if len(frames) != 5 {
+		t.Fatalf("operation frames=%d, want 5", len(frames))
+	}
+	if string(frames[4].data) != `{"i":4}` {
+		t.Fatalf("last frame=%s", frames[4].data)
 	}
 }
 
@@ -114,29 +150,26 @@ func TestItemEventsCarryOperations(t *testing.T) {
 	sub := env.hub().subscribe(item.id)
 	defer env.hub().unsubscribe(sub)
 	env.refreshState()
-	<-sub.ch
+	sub.drain()
 
 	op := env.ops().start("test.kind", item.id, nil)
 	env.ops().succeed(op.ID, []string{"careful"}, nil)
 
-	deadline := time.After(2 * time.Second)
 	seen := false
-	for !seen {
-		select {
-		case frame := <-sub.ch:
-			if frame.event != eventOperation {
-				continue
-			}
-			var got operation
-			if err := json.Unmarshal(frame.data, &got); err != nil {
-				t.Fatalf("operation frame: %v", err)
-			}
-			if got.ID == op.ID && got.State == opDone && len(got.Warnings) == 1 {
-				seen = true
-			}
-		case <-deadline:
-			t.Fatal("operation event never arrived")
+	for _, frame := range sub.drain() {
+		if frame.event != eventOperation {
+			continue
 		}
+		var got operation
+		if err := json.Unmarshal(frame.data, &got); err != nil {
+			t.Fatalf("operation frame: %v", err)
+		}
+		if got.ID == op.ID && got.State == opDone && len(got.Warnings) == 1 {
+			seen = true
+		}
+	}
+	if !seen {
+		t.Fatal("terminal operation event never arrived")
 	}
 }
 
@@ -148,7 +181,8 @@ func TestSlowSubscriberDoesNotBlockPublisher(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		for i := 0; i < 1000; i++ {
-			hub.publish(topicList, sseFrame{event: eventState, data: []byte("{}")})
+			hub.publishState(topicList, []byte(`{"n":`+strconv.Itoa(i)+`}`))
+			hub.publishOperationFrame(topicList, []byte("{}"))
 		}
 		close(done)
 	}()

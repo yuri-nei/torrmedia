@@ -36,9 +36,10 @@ type deleteBatch struct {
 }
 
 type deleteBatchOutcome struct {
-	status   int
-	err      string
-	response map[string]any
+	cancelled bool
+	status    int
+	err       string
+	response  map[string]any
 
 	perTarget map[string]*deleteBatchOutcome
 }
@@ -53,11 +54,12 @@ func (o *deleteBatchOutcome) forTarget(rel string) *deleteBatchOutcome {
 }
 
 type preparedDelete struct {
-	target   *deleteTarget
-	file     *os.File
-	info     os.FileInfo
-	priority int
-	size     int64
+	target    *deleteTarget
+	file      *os.File
+	info      os.FileInfo
+	unreserve func()
+	priority  int
+	size      int64
 }
 
 func allocatedBytes(info os.FileInfo) int64 {
@@ -171,12 +173,12 @@ func (s *server) cancelQueuedDelete(hash string, fileID int) bool {
 	if cancelled == nil {
 		return false
 	}
-	outcome := deleteBatchError(http.StatusConflict,
-		"queued delete for %q was cancelled by an enable request", cancelled.rel)
+	outcome := &deleteBatchOutcome{cancelled: true, status: http.StatusConflict,
+		err: "queued delete for " + cancelled.rel + " was cancelled"}
 	for _, waiter := range cancelled.waiters {
 		waiter <- outcome
 	}
-	log.Printf("delete: queued %s cancelled by enable (torrent=%s file=%d)", cancelled.rel, hash, fileID)
+	log.Printf("delete: queued %s cancelled (torrent=%s file=%d)", cancelled.rel, hash, fileID)
 	return true
 }
 
@@ -285,6 +287,9 @@ func closePreparedDeletes(prepared []*preparedDelete) {
 	for _, item := range prepared {
 		if item.file != nil {
 			_ = item.file.Close()
+		}
+		if item.unreserve != nil {
+			item.unreserve()
 		}
 	}
 }
@@ -416,13 +421,14 @@ func (s *server) deleteTorrentBatch(hash string, targets []*deleteTarget) *delet
 			reject(target, http.StatusConflict, "file %q changed while delete was prepared", target.rel)
 			continue
 		}
-		if s.streamReg().active(inodeKey(pinnedInfo)) {
+		unreserve, free := s.streamReg().reserve(inodeKey(pinnedInfo))
+		if !free {
 			_ = f.Close()
 			reject(target, http.StatusConflict, "file %q is being streamed right now", target.rel)
 			continue
 		}
 		prepared = append(prepared, &preparedDelete{
-			target: target, file: f, info: pinnedInfo,
+			target: target, file: f, info: pinnedInfo, unreserve: unreserve,
 			priority: qbFile.Priority, size: qbFile.Size,
 		})
 	}

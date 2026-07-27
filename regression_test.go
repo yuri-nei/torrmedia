@@ -111,7 +111,11 @@ func TestActiveStreamBlocksDelete(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer env.streamReg().acquire(inodeKey(info))()
+	release, ok := env.streamReg().acquire(inodeKey(info))
+	if !ok {
+		t.Fatal("stream could not be acquired")
+	}
+	defer release()
 
 	rec := env.do(t, http.MethodDelete, "/items/"+item.id+"?delete_files=true", "")
 	if rec.Code != http.StatusConflict {
@@ -172,7 +176,7 @@ func TestSmallFileKeepsDataInsteadOfDestroyingSharedPieces(t *testing.T) {
 	}
 }
 
-func TestEnableCancelsQueuedDelete(t *testing.T) {
+func TestQueuedDeleteIsCancellableThroughTheAPI(t *testing.T) {
 	root := testRoot(t)
 	const size = int64(1 << 20)
 	writeTestFile(t, filepath.Join(root, "shows", "Release", "e01.mkv"), size)
@@ -190,15 +194,18 @@ func TestEnableCancelsQueuedDelete(t *testing.T) {
 	}
 
 	rec := env.do(t, http.MethodDelete, "/items/"+item.id+"/files/"+item.files[0].id, "")
-	deleteOp := decodeJSON[operation](t, rec.Body.Bytes()).ID
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body)
+	}
+	opID := decodeJSON[operation](t, rec.Body.Bytes()).ID
 	waitForDeleteBatchSize(t, env.server, fake.torrents[0].hash, 1)
 
-	if !env.cancelQueuedDelete(fake.torrents[0].hash, 0) {
-		t.Fatal("queued delete was not cancelled")
+	if rec := env.do(t, http.MethodDelete, "/operations/"+opID, ""); rec.Code != http.StatusNoContent {
+		t.Fatalf("cancel status=%d body=%s, want 204", rec.Code, rec.Body)
 	}
-	op := env.awaitOperation(t, deleteOp)
-	if op.State != opFailed {
-		t.Fatalf("cancelled delete reported %s: %+v", op.State, op)
+	op := env.awaitOperation(t, opID)
+	if op.State != opCancelled {
+		t.Fatalf("cancelled operation reported %s: %+v", op.State, op)
 	}
 
 	time.Sleep(600 * time.Millisecond)
@@ -207,7 +214,42 @@ func TestEnableCancelsQueuedDelete(t *testing.T) {
 		t.Fatal(err)
 	}
 	if !bytes.Equal(original, after) {
-		t.Fatal("file was trimmed after the delete had been cancelled")
+		t.Fatal("file was trimmed after the operation had been cancelled")
+	}
+
+	if rec := env.do(t, http.MethodDelete, "/operations/"+opID, ""); rec.Code != http.StatusConflict {
+		t.Fatalf("second cancel status=%d, want 409", rec.Code)
+	}
+	if rec := env.do(t, http.MethodDelete, "/operations/op_missing", ""); rec.Code != http.StatusNotFound {
+		t.Fatalf("cancel of a missing operation status=%d, want 404", rec.Code)
+	}
+}
+
+func TestItemViewedClearFollowsActions(t *testing.T) {
+	env := newTestEnv(t)
+	cat, item := env.firstItem(t)
+
+	if contains(env.itemActionList(cat, item), actionClearViewed) {
+		t.Fatal("clear_viewed offered for an item without marks")
+	}
+	if rec := env.do(t, http.MethodDelete, "/items/"+item.id+"/viewed", ""); rec.Code != http.StatusConflict {
+		t.Fatalf("status=%d, want 409", rec.Code)
+	}
+
+	base := "/items/" + item.id + "/files/" + item.files[0].id + "/viewed"
+	if rec := env.do(t, http.MethodPut, base, `{"state":"watched"}`); rec.Code != http.StatusNoContent {
+		t.Fatalf("put status=%d", rec.Code)
+	}
+	cat, item = env.firstItem(t)
+	if !contains(env.itemActionList(cat, item), actionClearViewed) {
+		t.Fatal("clear_viewed is not offered for an item with marks")
+	}
+	if rec := env.do(t, http.MethodDelete, "/items/"+item.id+"/viewed", ""); rec.Code != http.StatusNoContent {
+		t.Fatalf("clear status=%d", rec.Code)
+	}
+	_, item = env.firstItem(t)
+	if item.files[0].watch != "" {
+		t.Fatalf("watch survived the clear: %q", item.files[0].watch)
 	}
 }
 
@@ -398,4 +440,57 @@ func TestPollUntilRefusesExpiredDeadline(t *testing.T) {
 	if elapsed := time.Since(start); elapsed > time.Second {
 		t.Fatalf("waited %s on an expired deadline", elapsed)
 	}
+}
+
+func TestDeleteReservesInodeAgainstLateStream(t *testing.T) {
+	env := newTestEnv(t)
+	_, item := env.firstItem(t)
+	target := filepath.Join(env.root, "shows", "Release", "e01.mkv")
+	info, err := os.Stat(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	key := inodeKey(info)
+
+	unreserve, free := env.streamReg().reserve(key)
+	if !free {
+		t.Fatal("could not reserve a quiet inode")
+	}
+	if _, ok := env.streamReg().acquire(key); ok {
+		t.Fatal("stream started on an inode reserved for deletion")
+	}
+	rec := env.do(t, http.MethodGet,
+		"/items/"+item.id+"/files/"+item.files[0].id+"/stream/e01.mkv", "")
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("stream of a reserved file: status=%d, want 409", rec.Code)
+	}
+	unreserve()
+
+	release, ok := env.streamReg().acquire(key)
+	if !ok {
+		t.Fatal("could not acquire a quiet inode")
+	}
+	if _, free := env.streamReg().reserve(key); free {
+		t.Fatal("delete reserved an inode that is being read")
+	}
+	release()
+	if _, free := env.streamReg().reserve(key); !free {
+		t.Fatal("inode stayed reserved after the stream ended")
+	}
+}
+
+func TestBusyItemDoesNotOfferPlay(t *testing.T) {
+	env := newTestEnv(t)
+	_, item := env.firstItem(t)
+
+	op := env.ops().start("test.block", item.id, nil)
+	cat := env.buildCatalog()
+	env.catalog.Store(cat)
+	busy := cat.item(item.id)
+	for i := range busy.files {
+		if contains(env.fileActionList(cat, busy, &busy.files[i]), actionPlay) {
+			t.Fatalf("busy item still offers play for %q", busy.files[i].name)
+		}
+	}
+	env.ops().succeed(op.ID, nil, nil)
 }

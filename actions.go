@@ -21,7 +21,12 @@ func (s *server) startOperation(w http.ResponseWriter, kind, itemID string, file
 	go func() {
 		defer s.inflight.Done()
 		result, warnings, err := body(op)
-		if err != nil {
+		switch {
+		case errors.Is(err, errOperationCancelled):
+			s.ops().markCancelled(op.ID)
+			s.poke()
+			return
+		case err != nil:
 			s.ops().fail(op.ID, err, warnings)
 			return
 		}
@@ -153,10 +158,15 @@ func (s *server) runFileDelete(op *operation, item *catalogItem, file *catalogFi
 	}
 
 	s.ops().phase(op.ID, "waiting")
+	hash, index := item.hash, file.qbitIndex
+	s.ops().setCancel(op.ID, func() bool { return s.cancelQueuedDelete(hash, index) })
 	outcome := s.awaitDelete(&deleteTarget{
 		rel: rel, abs: abs, info: info,
-		match: qbMatch{hash: item.hash, fileID: file.qbitIndex, abs: abs},
+		match: qbMatch{hash: hash, fileID: index, abs: abs},
 	})
+	if outcome.cancelled {
+		return nil, nil, errOperationCancelled
+	}
 	if outcome.err != "" {
 		return nil, nil, errors.New(outcome.err)
 	}
@@ -177,9 +187,11 @@ func (s *server) removeShelfFile(file *catalogFile) error {
 	if err != nil {
 		return err
 	}
-	if s.streamReg().active(inodeKey(info)) {
+	unreserve, free := s.streamReg().reserve(inodeKey(info))
+	if !free {
 		return errors.New("file is being streamed right now")
 	}
+	defer unreserve()
 	if err := os.Remove(abs); err != nil {
 		return err
 	}
@@ -194,10 +206,6 @@ func (s *server) runFileEnable(op *operation, hash string, index int) (map[strin
 	}
 	defer unlock()
 	warnings := []string{}
-
-	if s.cancelQueuedDelete(hash, index) {
-		warnings = append(warnings, "a queued delete for this file was cancelled")
-	}
 
 	t, err := s.qb.torrent(hash)
 	if err != nil {
