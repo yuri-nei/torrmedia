@@ -32,6 +32,13 @@ func (s *server) torrentView(t *qbTorrent) map[string]any {
 		"save_path": t.SavePath, "content_path": t.ContentPath,
 		"size": t.Size, "amount_left": t.AmountLeft,
 		"force_start": t.ForceStart, "item_path": s.itemPath(t),
+
+		"magnet_uri": t.MagnetURI, "dlspeed": t.DlSpeed, "upspeed": t.UpSpeed,
+		"eta": t.ETA, "ratio": t.Ratio,
+		"downloaded": t.Downloaded, "uploaded": t.Uploaded, "completed": t.Completed,
+		"num_seeds": t.NumSeeds, "num_complete": t.NumComplete,
+		"num_leechs": t.NumLeechs, "num_incomplete": t.NumIncomplete,
+		"added_on": t.AddedOn, "completion_on": t.CompletionOn,
 	}
 }
 

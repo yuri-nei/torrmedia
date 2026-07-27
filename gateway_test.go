@@ -17,6 +17,7 @@ type gatewayFake struct {
 	category    string
 	size        int64
 	forceStart  bool
+	magnet      string
 	deleteCalls []string
 }
 
@@ -27,7 +28,11 @@ func (g *gatewayFake) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			Hash: g.inner.hash, Name: g.inner.name, SavePath: g.inner.savePath,
 			ContentPath: filepath.Join(g.inner.savePath, g.inner.name),
 			State:       g.inner.state, Progress: 1, Category: g.category,
-			Size: g.size, ForceStart: g.forceStart,
+			Size: g.size, ForceStart: g.forceStart, MagnetURI: g.magnet,
+			DlSpeed: 1, UpSpeed: 2, ETA: 3, Ratio: 0.5,
+			Downloaded: 10, Uploaded: 20, Completed: 30,
+			NumSeeds: 1, NumComplete: 2, NumLeechs: 3, NumIncomplete: 4,
+			AddedOn: 1700000000, CompletionOn: 1700000001,
 		}})
 		return
 	case "/api/v2/torrents/categories":
@@ -76,6 +81,7 @@ func gatewayFixture(t *testing.T) (*server, *gatewayFake, string) {
 	fake := &gatewayFake{
 		inner:    oneFileFake(root, filepath.Join("release", "episode.mkv"), size, 1),
 		category: "Shows", size: size,
+		magnet: "magnet:?xt=urn:btih:0123456789012345678901234567890123456789&tr=http://tracker/announce",
 	}
 	return newGatewayServer(t, root, fake), fake, rel
 }
@@ -114,7 +120,32 @@ func TestTorrentsExposeShelfItemPath(t *testing.T) {
 	if _, ok := torrent["force_start"]; !ok {
 		t.Fatalf("force_start missing: %v", torrent)
 	}
-	_ = fake
+	for _, field := range []string{
+		"magnet_uri", "dlspeed", "upspeed", "eta", "ratio",
+		"downloaded", "uploaded", "completed",
+		"num_seeds", "num_complete", "num_leechs", "num_incomplete",
+		"added_on", "completion_on", "amount_left", "size",
+	} {
+		if _, ok := torrent[field]; !ok {
+			t.Fatalf("%s missing from the torrent view: %v", field, torrent)
+		}
+	}
+	if torrent["magnet_uri"] != fake.magnet {
+		t.Fatalf("magnet_uri=%v, want %q", torrent["magnet_uri"], fake.magnet)
+	}
+}
+
+func TestTorrentDetailCarriesTheSameHeaderFields(t *testing.T) {
+	s, fake, _ := gatewayFixture(t)
+	recorder := httptest.NewRecorder()
+	s.handleTorrent(recorder, httptest.NewRequest(http.MethodGet,
+		"/torrent?hash="+fake.inner.hash, nil))
+	body := decode(t, recorder)
+	for _, field := range []string{"magnet_uri", "amount_left", "item_path", "category", "eta"} {
+		if _, ok := body[field]; !ok {
+			t.Fatalf("%s missing from the torrent detail: %v", field, body)
+		}
+	}
 }
 
 func TestTorrentOutsideRootHasEmptyItemPath(t *testing.T) {
