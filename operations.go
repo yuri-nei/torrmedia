@@ -3,20 +3,16 @@ package main
 import (
 	"crypto/rand"
 	"encoding/hex"
-	"errors"
 	"sync"
 	"time"
 )
 
 const (
-	opQueued    = "queued"
-	opRunning   = "running"
-	opDone      = "done"
-	opFailed    = "failed"
-	opCancelled = "cancelled"
+	opQueued  = "queued"
+	opRunning = "running"
+	opDone    = "done"
+	opFailed  = "failed"
 )
-
-var errOperationCancelled = errors.New("operation was cancelled")
 
 type operation struct {
 	ID         string         `json:"id"`
@@ -30,8 +26,6 @@ type operation struct {
 	Error      *string        `json:"error"`
 	Warnings   []string       `json:"warnings"`
 	Result     map[string]any `json:"result"`
-
-	cancel func() bool
 }
 
 type operations struct {
@@ -148,50 +142,8 @@ func (o *operations) fail(id string, err error, warnings []string) {
 	})
 }
 
-func (o *operations) markCancelled(id string) {
-	o.update(id, func(op *operation) {
-		op.State = opCancelled
-		op.Phase = nil
-		op.Error = nil
-	})
-}
-
-func (o *operations) requestCancel(id string) error {
-	o.mu.Lock()
-	op := o.byID[id]
-	if op == nil {
-		o.mu.Unlock()
-		return errNoSuchOperation
-	}
-	if op.finished() {
-		o.mu.Unlock()
-		return errOperationFinished
-	}
-	cancel := op.cancel
-	o.mu.Unlock()
-
-	if cancel == nil || !cancel() {
-		return errOperationStarted
-	}
-	return nil
-}
-
-var (
-	errNoSuchOperation   = errors.New("no such operation")
-	errOperationFinished = errors.New("operation has already finished")
-	errOperationStarted  = errors.New("operation has already started and cannot be cancelled")
-)
-
 func (o *operation) finished() bool {
-	return o.State == opDone || o.State == opFailed || o.State == opCancelled
-}
-
-func (o *operations) setCancel(id string, cancel func() bool) {
-	o.mu.Lock()
-	if op := o.byID[id]; op != nil {
-		op.cancel = cancel
-	}
-	o.mu.Unlock()
+	return o.State == opDone || o.State == opFailed
 }
 
 func (o *operations) get(id string) (operation, bool) {

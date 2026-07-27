@@ -15,7 +15,7 @@ import (
 	"time"
 )
 
-const version = "2026-07-28.3"
+const version = "2026-07-28.4"
 
 type server struct {
 	root   string
@@ -39,9 +39,6 @@ type server struct {
 
 	viewed   *viewedStore
 	playback playbackConfig
-
-	torrentDir  string
-	allowURLAdd bool
 
 	events     *eventHub
 	operations *operations
@@ -170,11 +167,6 @@ func main() {
 		enableReserve:     512 << 20,
 		availableBytes:    availableFilesystemBytes,
 		playback:          defaultPlaybackConfig(),
-		torrentDir:        envOr("TORRMEDIA_TORRENT_DIR", "/etc/torrmedia/torrents"),
-		allowURLAdd:       os.Getenv("TORRMEDIA_ALLOW_URL_ADD") == "true",
-	}
-	if err := parsePlaybackConfig(&s.playback); err != nil {
-		log.Fatal(err)
 	}
 	s.viewed, err = newViewedStore(envOr("TORRMEDIA_VIEWED_FILE", "/var/lib/torrmedia/viewed.json"))
 	if err != nil {

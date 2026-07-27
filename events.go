@@ -25,14 +25,13 @@ type sseFrame struct {
 type eventSub struct {
 	topic string
 
-	mu      sync.Mutex
-	state   []byte
-	ops     [][]byte
-	pings   int
-	closed  bool
-	wake    chan struct{}
-	maxOps  int
-	dropped bool
+	mu     sync.Mutex
+	state  []byte
+	ops    [][]byte
+	pings  int
+	closed bool
+	wake   chan struct{}
+	maxOps int
 }
 
 func newEventSub(topic string) *eventSub {
@@ -60,7 +59,6 @@ func (s *eventSub) pushOperation(data []byte) {
 	if !s.closed {
 		if len(s.ops) >= s.maxOps {
 			s.ops = s.ops[1:]
-			s.dropped = true
 		}
 		s.ops = append(s.ops, data)
 	}

@@ -22,10 +22,6 @@ func (s *server) startOperation(w http.ResponseWriter, kind, itemID string, file
 		defer s.inflight.Done()
 		result, warnings, err := body(op)
 		switch {
-		case errors.Is(err, errOperationCancelled):
-			s.ops().markCancelled(op.ID)
-			s.poke()
-			return
 		case err != nil:
 			s.ops().fail(op.ID, err, warnings)
 			return
@@ -159,14 +155,10 @@ func (s *server) runFileDelete(op *operation, item *catalogItem, file *catalogFi
 
 	s.ops().phase(op.ID, "waiting")
 	hash, index := item.hash, file.qbitIndex
-	s.ops().setCancel(op.ID, func() bool { return s.cancelQueuedDelete(hash, index) })
 	outcome := s.awaitDelete(&deleteTarget{
-		rel: rel, abs: abs, info: info,
+		rel: rel, info: info,
 		match: qbMatch{hash: hash, fileID: index, abs: abs},
 	})
-	if outcome.cancelled {
-		return nil, nil, errOperationCancelled
-	}
 	if outcome.err != "" {
 		return nil, nil, errors.New(outcome.err)
 	}
@@ -320,37 +312,12 @@ func (s *server) runAddMagnet(op *operation, magnet, category string) (map[strin
 	return map[string]any{"added": true}, []string{}, nil
 }
 
-func (s *server) runAddTorrentFile(op *operation, name, category string) (map[string]any, []string, error) {
-	s.ops().phase(op.ID, "adding")
-	data, err := os.ReadFile(filepath.Join(s.torrentDir, name))
-	if err != nil {
-		return nil, nil, err
-	}
-	fields := map[string]string{}
-	if category != "" {
-		fields["category"] = category
-	}
-	if err := s.qb.addTorrentFile(name, data, fields); err != nil {
-		return nil, nil, err
-	}
-	log.Printf("add: ok (category=%q source=torrent-file)", category)
-	s.poke()
-	return map[string]any{"added": true}, []string{}, nil
-}
-
-func (s *server) checkAddLink(link string) error {
+func checkAddLink(link string) error {
 	lower := strings.ToLower(strings.TrimSpace(link))
-	switch {
-	case strings.HasPrefix(lower, "magnet:?"):
+	if strings.HasPrefix(lower, "magnet:?") {
 		return nil
-	case strings.HasPrefix(lower, "http://"), strings.HasPrefix(lower, "https://"):
-		if s.allowURLAdd {
-			return nil
-		}
-		return errors.New("http(s) links are refused; set TORRMEDIA_ALLOW_URL_ADD=true to fetch them server-side")
-	default:
-		return errors.New("only magnet: links are accepted")
 	}
+	return errors.New("only magnet: links are accepted")
 }
 
 func checkCategory(category string) error {

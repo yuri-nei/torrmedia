@@ -175,55 +175,6 @@ func TestSmallFileKeepsDataInsteadOfDestroyingSharedPieces(t *testing.T) {
 	}
 }
 
-func TestQueuedDeleteIsCancellableThroughTheAPI(t *testing.T) {
-	root := testRoot(t)
-	const size = int64(1 << 20)
-	writeTestFile(t, filepath.Join(root, "shows", "Release", "e01.mkv"), size)
-	fake := newFakeQbit(&fakeTorrent{
-		hash: "0123456789012345678901234567890123456789", name: "Release",
-		savePath: filepath.Join(root, "shows"), state: "stoppedUP",
-		files: []fakeFile{{name: filepath.Join("Release", "e01.mkv"), size: size, priority: 1, progress: 1}},
-	})
-	env := newTestEnvWith(t, root, fake)
-	env.deleteDebounce = 400 * time.Millisecond
-	_, item := env.firstItem(t)
-	original, err := os.ReadFile(filepath.Join(root, "shows", "Release", "e01.mkv"))
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	rec := env.do(t, http.MethodDelete, "/items/"+item.id+"/files/"+item.files[0].id, "")
-	if rec.Code != http.StatusAccepted {
-		t.Fatalf("status=%d body=%s", rec.Code, rec.Body)
-	}
-	opID := decodeJSON[operation](t, rec.Body.Bytes()).ID
-	waitForDeleteBatchSize(t, env.server, fake.torrents[0].hash, 1)
-
-	if rec := env.do(t, http.MethodDelete, "/operations/"+opID, ""); rec.Code != http.StatusNoContent {
-		t.Fatalf("cancel status=%d body=%s, want 204", rec.Code, rec.Body)
-	}
-	op := env.awaitOperation(t, opID)
-	if op.State != opCancelled {
-		t.Fatalf("cancelled operation reported %s: %+v", op.State, op)
-	}
-
-	time.Sleep(600 * time.Millisecond)
-	after, err := os.ReadFile(filepath.Join(root, "shows", "Release", "e01.mkv"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !bytes.Equal(original, after) {
-		t.Fatal("file was trimmed after the operation had been cancelled")
-	}
-
-	if rec := env.do(t, http.MethodDelete, "/operations/"+opID, ""); rec.Code != http.StatusConflict {
-		t.Fatalf("second cancel status=%d, want 409", rec.Code)
-	}
-	if rec := env.do(t, http.MethodDelete, "/operations/op_missing", ""); rec.Code != http.StatusNotFound {
-		t.Fatalf("cancel of a missing operation status=%d, want 404", rec.Code)
-	}
-}
-
 func TestItemViewedClearFollowsActions(t *testing.T) {
 	env := newTestEnv(t)
 	cat, item := env.firstItem(t)
@@ -249,26 +200,6 @@ func TestItemViewedClearFollowsActions(t *testing.T) {
 	_, item = env.firstItem(t)
 	if item.files[0].watch != "" {
 		t.Fatalf("watch survived the clear: %q", item.files[0].watch)
-	}
-}
-
-func waitForDeleteBatchSize(t *testing.T, s *server, hash string, want int) {
-	t.Helper()
-	deadline := time.Now().Add(2 * time.Second)
-	for {
-		s.deleteMu.Lock()
-		got := 0
-		if batch := s.deleteBatches[hash]; batch != nil {
-			got = len(batch.targets)
-		}
-		s.deleteMu.Unlock()
-		if got == want {
-			return
-		}
-		if time.Now().After(deadline) {
-			t.Fatalf("queued delete batch size=%d, want %d", got, want)
-		}
-		time.Sleep(time.Millisecond)
 	}
 }
 
@@ -347,19 +278,6 @@ func TestTrackableRange(t *testing.T) {
 		if got := trackableRange(header); got != want {
 			t.Fatalf("trackableRange(%q)=%v, want %v", header, got, want)
 		}
-	}
-}
-
-func TestRedactQueryHidesSecrets(t *testing.T) {
-	got := redactQuery(map[string][]string{
-		"magnet":       {"magnet:?xt=urn:btih:abc&tr=http://tracker/PASSKEY/announce"},
-		"delete_files": {"true"},
-	})
-	if strings.Contains(got, "PASSKEY") || strings.Contains(got, "magnet:?") {
-		t.Fatalf("secret leaked into the log line: %s", got)
-	}
-	if !strings.Contains(got, "delete_files=true") {
-		t.Fatalf("useful parameters were lost: %s", got)
 	}
 }
 

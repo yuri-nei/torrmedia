@@ -23,7 +23,6 @@ type trimResult struct {
 
 type deleteTarget struct {
 	rel     string
-	abs     string
 	info    os.FileInfo
 	match   qbMatch
 	waiters []chan *deleteBatchOutcome
@@ -36,10 +35,9 @@ type deleteBatch struct {
 }
 
 type deleteBatchOutcome struct {
-	cancelled bool
-	status    int
-	err       string
-	response  map[string]any
+	status   int
+	err      string
+	response map[string]any
 
 	perTarget map[string]*deleteBatchOutcome
 }
@@ -145,41 +143,6 @@ func (s *server) awaitDelete(target *deleteTarget) *deleteBatchOutcome {
 	s.enqueueTorrentDelete(target)
 	outcome := <-result
 	return outcome.forTarget(target.rel)
-}
-
-func (s *server) cancelQueuedDelete(hash string, fileID int) bool {
-	s.deleteMu.Lock()
-	batch := s.deleteBatches[hash]
-	if batch == nil {
-		s.deleteMu.Unlock()
-		return false
-	}
-	var cancelled *deleteTarget
-	for rel, target := range batch.targets {
-		if target.match.fileID == fileID {
-			cancelled = target
-			delete(batch.targets, rel)
-			break
-		}
-	}
-	if cancelled != nil && len(batch.targets) == 0 {
-		if batch.timer != nil {
-			batch.timer.Stop()
-		}
-		delete(s.deleteBatches, hash)
-	}
-	s.deleteMu.Unlock()
-
-	if cancelled == nil {
-		return false
-	}
-	outcome := &deleteBatchOutcome{cancelled: true, status: http.StatusConflict,
-		err: "queued delete for " + cancelled.rel + " was cancelled"}
-	for _, waiter := range cancelled.waiters {
-		waiter <- outcome
-	}
-	log.Printf("delete: queued %s cancelled (torrent=%s file=%d)", cancelled.rel, hash, fileID)
-	return true
 }
 
 func (s *server) pendingBatch(hash string) bool {

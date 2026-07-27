@@ -79,23 +79,6 @@ func (v *viewedStore) snapshot() map[string]viewedEntry {
 	return out
 }
 
-func (v *viewedStore) list(path, item string) []viewedEntry {
-	v.mu.Lock()
-	defer v.mu.Unlock()
-	out := make([]viewedEntry, 0, len(v.items))
-	for _, entry := range v.items {
-		if path != "" && entry.Path != path {
-			continue
-		}
-		if item != "" && entry.Item != item {
-			continue
-		}
-		out = append(out, entry)
-	}
-	sort.Slice(out, func(i, j int) bool { return out[i].Path < out[j].Path })
-	return out
-}
-
 func (v *viewedStore) update(fn func(map[string]viewedEntry)) error {
 	v.mu.Lock()
 	defer v.mu.Unlock()
@@ -412,41 +395,4 @@ func (s *server) trackPlayback(rel, item string, size, start, delta, requestTota
 			items[rel] = entry
 		}
 	})
-}
-
-func parsePlaybackConfig(cfg *playbackConfig) error {
-	for key, target := range map[string]*float64{
-		"TORRMEDIA_WATCHED_FRACTION":      &cfg.watchedFraction,
-		"TORRMEDIA_END_FRACTION":          &cfg.endFraction,
-		"TORRMEDIA_STARTED_FRACTION":      &cfg.startedFraction,
-		"TORRMEDIA_MANUAL_RESET_FRACTION": &cfg.manualResetFraction,
-	} {
-		if value := os.Getenv(key); value != "" {
-			parsed, err := strconv.ParseFloat(value, 64)
-			if err != nil || parsed <= 0 || parsed > 1 {
-				return fmt.Errorf("%s must be a number in (0, 1]", key)
-			}
-			*target = parsed
-		}
-	}
-	for key, target := range map[string]*int64{
-		"TORRMEDIA_STARTED_BYTES":  &cfg.startedBytes,
-		"TORRMEDIA_MIN_PLAY_CHUNK": &cfg.minPlayChunk,
-	} {
-		if value := os.Getenv(key); value != "" {
-			parsed, err := strconv.ParseInt(value, 10, 64)
-			if err != nil || parsed <= 0 {
-				return fmt.Errorf("%s must be a positive integer", key)
-			}
-			*target = parsed
-		}
-	}
-	if value := os.Getenv("TORRMEDIA_VIEWED_FLUSH_INTERVAL"); value != "" {
-		parsed, err := time.ParseDuration(value)
-		if err != nil || parsed <= 0 {
-			return fmt.Errorf("TORRMEDIA_VIEWED_FLUSH_INTERVAL must be a positive duration")
-		}
-		cfg.flushInterval = parsed
-	}
-	return nil
 }

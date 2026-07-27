@@ -1,17 +1,13 @@
 package main
 
 import (
-	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
-	"mime/multipart"
 	"net/http"
 	"net/http/cookiejar"
 	"net/url"
-	"os"
-	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -71,10 +67,9 @@ type qbProperties struct {
 }
 
 type qbMatch struct {
-	hash     string
-	fileID   int
-	abs      string
-	priority int
+	hash   string
+	fileID int
+	abs    string
 }
 
 func newQbit(rawURL, user, pass string) (*qbit, error) {
@@ -178,57 +173,6 @@ func (q *qbit) getText(path string, out *string) error {
 	return nil
 }
 
-func (q *qbit) findFile(target os.FileInfo) (*qbMatch, error) {
-	var torrents []qbTorrent
-	if err := q.getJSON("/api/v2/torrents/info", &torrents); err != nil {
-		return nil, err
-	}
-	var match *qbMatch
-	for _, t := range torrents {
-		var files []qbFile
-		if err := q.getJSON("/api/v2/torrents/files?hash="+url.QueryEscape(t.Hash), &files); err != nil {
-			return nil, err
-		}
-		for i, f := range files {
-			abs := filepath.Join(t.SavePath, f.Name)
-			fi, err := os.Stat(abs)
-			if err != nil {
-				continue
-			}
-			if os.SameFile(target, fi) {
-				id := i
-				if f.Index != nil {
-					id = *f.Index
-				}
-				if match != nil && (match.hash != t.Hash || match.fileID != id) {
-					return nil, errors.New("file inode belongs to multiple torrent entries; refusing ambiguous delete")
-				}
-				match = &qbMatch{hash: t.Hash, fileID: id, abs: abs, priority: f.Priority}
-			}
-		}
-	}
-	return match, nil
-}
-
-func (q *qbit) findTorrentByPath(abs string) (*qbTorrent, error) {
-	var torrents []qbTorrent
-	if err := q.getJSON("/api/v2/torrents/info", &torrents); err != nil {
-		return nil, err
-	}
-	for _, t := range torrents {
-		for _, base := range []string{t.ContentPath, filepath.Join(t.SavePath, t.Name)} {
-			if base == "" {
-				continue
-			}
-			base = strings.TrimSuffix(base, "/")
-			if abs == base || strings.HasPrefix(abs, base+"/") {
-				return &t, nil
-			}
-		}
-	}
-	return nil, nil
-}
-
 func (q *qbit) files(hash string) ([]qbFile, error) {
 	var files []qbFile
 	err := q.getJSON("/api/v2/torrents/files?hash="+url.QueryEscape(hash), &files)
@@ -279,12 +223,7 @@ func qbFileByID(files []qbFile, id int) (*qbFile, bool) {
 }
 
 func (q *qbit) switchTorrent(hash, action string) error {
-	legacy := map[string]string{"start": "resume", "stop": "pause"}[action]
-	err := q.postOK("/api/v2/torrents/"+action, url.Values{"hashes": {hash}})
-	if err != nil && legacy != "" {
-		err = q.postOK("/api/v2/torrents/"+legacy, url.Values{"hashes": {hash}})
-	}
-	return err
+	return q.postOK("/api/v2/torrents/"+action, url.Values{"hashes": {hash}})
 }
 
 func pollUntil(timeout, interval time.Duration, check func() (bool, error)) error {
@@ -375,56 +314,6 @@ func (q *qbit) waitRecheck(hash string, id int, timeout, interval time.Duration)
 		settled++
 		return settled >= requiredSettled, nil
 	})
-}
-
-func (q *qbit) addTorrentFile(name string, data []byte, fields map[string]string) error {
-	var buf bytes.Buffer
-	mw := multipart.NewWriter(&buf)
-	for k, v := range fields {
-		if err := mw.WriteField(k, v); err != nil {
-			return err
-		}
-	}
-	part, err := mw.CreateFormFile("torrents", name)
-	if err != nil {
-		return err
-	}
-	if _, err = part.Write(data); err != nil {
-		return err
-	}
-	if err = mw.Close(); err != nil {
-		return err
-	}
-	post := func() (*http.Response, error) {
-		req, err := http.NewRequest("POST", q.base.String()+"/api/v2/torrents/add", bytes.NewReader(buf.Bytes()))
-		if err != nil {
-			return nil, err
-		}
-		req.Header.Set("Content-Type", mw.FormDataContentType())
-		req.Header.Set("Referer", q.base.String())
-		req.Header.Set("Origin", q.base.String())
-		return q.hc.Do(req)
-	}
-	resp, err := post()
-	if err != nil {
-		return err
-	}
-	if resp.StatusCode == http.StatusForbidden || resp.StatusCode == http.StatusUnauthorized {
-		io.Copy(io.Discard, resp.Body)
-		resp.Body.Close()
-		if err := q.login(); err != nil {
-			return err
-		}
-		if resp, err = post(); err != nil {
-			return err
-		}
-	}
-	defer resp.Body.Close()
-	body, _ := io.ReadAll(resp.Body)
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("add: HTTP %d %s", resp.StatusCode, strings.TrimSpace(string(body)))
-	}
-	return nil
 }
 
 func (q *qbit) recheck(hash string) error {

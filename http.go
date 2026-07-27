@@ -6,9 +6,6 @@ import (
 	"fmt"
 	"log"
 	"net/http"
-	"net/url"
-	"sort"
-	"strings"
 )
 
 const (
@@ -57,28 +54,6 @@ func decodeBody(r *http.Request, v any) error {
 	return nil
 }
 
-var secretQueryKeys = map[string]bool{"magnet": true, "url": true, "file": true}
-
-func redactQuery(q url.Values) string {
-	if len(q) == 0 {
-		return ""
-	}
-	keys := make([]string, 0, len(q))
-	for k := range q {
-		keys = append(keys, k)
-	}
-	sort.Strings(keys)
-	parts := make([]string, 0, len(keys))
-	for _, k := range keys {
-		if secretQueryKeys[k] {
-			parts = append(parts, k+"=[redacted]")
-			continue
-		}
-		parts = append(parts, k+"="+q.Get(k))
-	}
-	return "?" + strings.Join(parts, "&")
-}
-
 func (s *server) wrap(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if s.token != "" && r.URL.Path != "/health" {
@@ -94,7 +69,7 @@ func (s *server) wrap(next http.Handler) http.Handler {
 					"torrmedia is shutting down")
 				return
 			}
-			log.Printf("%s %s %s%s", r.RemoteAddr, r.Method, r.URL.Path, redactQuery(r.URL.Query()))
+			log.Printf("%s %s %s", r.RemoteAddr, r.Method, r.URL.Path)
 		}
 		next.ServeHTTP(w, r)
 	})

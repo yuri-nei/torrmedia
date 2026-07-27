@@ -1,7 +1,6 @@
 package main
 
 import (
-	"errors"
 	"net/http"
 	"strconv"
 	"strings"
@@ -13,7 +12,6 @@ func (s *server) routes() http.Handler {
 	mux.HandleFunc("GET /health", s.handleHealth)
 	mux.HandleFunc("GET /categories", s.handleCategories)
 	mux.HandleFunc("GET /operations/{op}", s.handleOperation)
-	mux.HandleFunc("DELETE /operations/{op}", s.handleOperationCancel)
 
 	mux.HandleFunc("GET /events", func(w http.ResponseWriter, r *http.Request) {
 		s.serveEvents(w, r, topicList)
@@ -34,8 +32,6 @@ func (s *server) routes() http.Handler {
 	mux.HandleFunc("DELETE /items/{item}/files/{file}/viewed", s.handleFileViewedClear)
 	mux.HandleFunc("GET /items/{item}/files/{file}/stream/{name...}", s.handleStream)
 	mux.HandleFunc("HEAD /items/{item}/files/{file}/stream/{name...}", s.handleStream)
-
-	mux.HandleFunc("POST /admin/items", s.handleAdminAdd)
 
 	return s.wrap(mux)
 }
@@ -169,18 +165,6 @@ func (s *server) handleOperation(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, op)
 }
 
-func (s *server) handleOperationCancel(w http.ResponseWriter, r *http.Request) {
-	switch err := s.ops().requestCancel(r.PathValue("op")); {
-	case err == nil:
-		s.poke()
-		writeNoContent(w)
-	case errors.Is(err, errNoSuchOperation):
-		writeErr(w, http.StatusNotFound, codeNotFound, "%v", err)
-	default:
-		writeErr(w, http.StatusConflict, codeBusy, "%v", err)
-	}
-}
-
 func (s *server) itemCommand(action string) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		cat, item, ok := s.resolveItem(w, r)
@@ -245,7 +229,7 @@ func (s *server) handleItemCreate(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadGateway, codeQbitUnavailable, "qbittorrent is not configured")
 		return
 	}
-	if err := s.checkAddLink(body.Magnet); err != nil {
+	if err := checkAddLink(body.Magnet); err != nil {
 		writeErr(w, http.StatusForbidden, codeRefused, "%v", err)
 		return
 	}
@@ -365,34 +349,6 @@ func (s *server) handleItemViewedClear(w http.ResponseWriter, r *http.Request) {
 	}
 	s.poke()
 	writeNoContent(w)
-}
-
-func (s *server) handleAdminAdd(w http.ResponseWriter, r *http.Request) {
-	var body struct {
-		File     string `json:"file"`
-		Category string `json:"category"`
-	}
-	if err := decodeBody(r, &body); err != nil {
-		writeErr(w, http.StatusBadRequest, codeBadRequest, "%v", err)
-		return
-	}
-	if s.qb == nil {
-		writeErr(w, http.StatusBadGateway, codeQbitUnavailable, "qbittorrent is not configured")
-		return
-	}
-	if body.File == "" || strings.ContainsAny(body.File, `/\`) || strings.HasPrefix(body.File, ".") {
-		writeErr(w, http.StatusBadRequest, codeBadRequest,
-			"file must be a bare name inside %s", s.torrentDir)
-		return
-	}
-	if err := checkCategory(body.Category); err != nil {
-		writeErr(w, http.StatusBadRequest, codeBadRequest, "%v", err)
-		return
-	}
-	name, category := body.File, body.Category
-	s.startOperation(w, "item.add", "", nil, func(op *operation) (map[string]any, []string, error) {
-		return s.runAddTorrentFile(op, name, category)
-	})
 }
 
 func parseBoolQuery(r *http.Request, key string) (bool, error) {
