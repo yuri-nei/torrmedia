@@ -80,7 +80,8 @@ systemctl restart torrmedia
 sleep 1
 echo "== status =="
 systemctl --no-pager --lines=5 status torrmedia | grep -E "●|Active:|Main PID" || true
-ss -tln | grep -q ":${TORRMEDIA_LISTEN##*:}" || ss -tln | grep 8091 || echo "WARN: port is not listening"
+PORT="$(. /etc/torrmedia/config.env; echo "${TORRMEDIA_LISTEN:-:8091}")"
+ss -tln | grep -q ":${PORT##*:}" && echo "listening on port ${PORT##*:}" || echo "WARN: port ${PORT##*:} is not listening"
 echo
 echo "Done. No port was opened to the outside: set up the firewall or VPN yourself (see README)."
 echo "Check: curl -fsS http://127.0.0.1:8091/health"
