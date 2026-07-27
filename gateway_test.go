@@ -148,6 +148,24 @@ func TestTorrentDetailCarriesTheSameHeaderFields(t *testing.T) {
 	}
 }
 
+func TestHealthAnnouncesContractVersion(t *testing.T) {
+	s, _, _ := gatewayFixture(t)
+	store, err := newViewedStore(filepath.Join(t.TempDir(), "viewed.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.viewed = store
+	recorder := httptest.NewRecorder()
+	s.handleHealth(recorder, httptest.NewRequest(http.MethodGet, "/health", nil))
+	body := decode(t, recorder)
+	if got, ok := body["contract"].(float64); !ok || int(got) != contractVersion {
+		t.Fatalf("contract=%v, want %d", body["contract"], contractVersion)
+	}
+	if body["version"] != version {
+		t.Fatalf("version=%v, want %q", body["version"], version)
+	}
+}
+
 func TestTorrentOutsideRootHasEmptyItemPath(t *testing.T) {
 	s, _, _ := gatewayFixture(t)
 	outside := &qbTorrent{Hash: "x", Name: "other", SavePath: "/srv/elsewhere",

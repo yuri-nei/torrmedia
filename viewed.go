@@ -250,7 +250,9 @@ func (s *server) handleViewed(w http.ResponseWriter, r *http.Request) {
 
 	switch r.Method {
 	case http.MethodGet:
-		writeJSON(w, http.StatusOK, viewedFile{Items: s.viewed.list(path, item)})
+		writeJSON(w, http.StatusOK, map[string]any{
+			"ok": true, "items": s.viewed.list(path, item),
+		})
 	case http.MethodPost:
 		if path == "" || item != "" {
 			writeErr(w, http.StatusBadRequest, "exactly one path is required")

@@ -136,7 +136,7 @@ func (s *server) fsRoot() *os.Root {
 	return s.osRoot
 }
 
-const version = "2026-07-27.2"
+const version = "2026-07-27.3"
 
 var errBadPath = errors.New("bad path")
 
@@ -410,7 +410,7 @@ func (s *server) handleList(w http.ResponseWriter, r *http.Request) {
 	items, qbitAvailable := s.enrichOwnership(items)
 	s.enrichViewed(items)
 	writeJSON(w, http.StatusOK, map[string]any{
-		"items": items, "qbit_available": qbitAvailable,
+		"ok": true, "items": items, "qbit_available": qbitAvailable,
 	})
 }
 
@@ -2063,7 +2063,10 @@ func (s *server) wrap(next http.Handler) http.Handler {
 }
 
 func (s *server) handleHealth(w http.ResponseWriter, _ *http.Request) {
-	status := healthStatus{OK: true, Version: version, Checks: map[string]string{}}
+	status := healthStatus{
+		OK: true, Version: version, Contract: contractVersion,
+		Checks: map[string]string{},
+	}
 	switch root := s.fsRoot(); {
 	case root == nil:
 		status.OK = false

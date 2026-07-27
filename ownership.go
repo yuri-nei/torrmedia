@@ -173,10 +173,13 @@ func (t *lockTable) lock(key string) func() {
 
 // --- health ---
 
+const contractVersion = 1
+
 type healthStatus struct {
-	OK      bool              `json:"ok"`
-	Version string            `json:"version"`
-	Checks  map[string]string `json:"checks"`
+	OK       bool              `json:"ok"`
+	Version  string            `json:"version"`
+	Contract int               `json:"contract"`
+	Checks   map[string]string `json:"checks"`
 }
 
 type qbitProbe struct {
