@@ -4,28 +4,12 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"path/filepath"
 	"sync"
 	"syscall"
 	"time"
 )
 
 var errTorrentNotFound = errors.New("torrent not found")
-
-type fileOwner struct {
-	hash      string
-	fileID    int
-	priority  int
-	progress  float64
-	ambiguous bool
-}
-
-func (o fileOwner) known() bool { return o.hash != "" && !o.ambiguous }
-
-type ownershipIndex struct {
-	byInode map[string]fileOwner
-	byPath  map[string]fileOwner
-}
 
 func inodeKey(info os.FileInfo) string {
 	if info == nil {
@@ -36,69 +20,6 @@ func inodeKey(info os.FileInfo) string {
 		return ""
 	}
 	return fmt.Sprintf("%d:%d", uint64(st.Dev), uint64(st.Ino))
-}
-
-func (idx *ownershipIndex) put(key string, m map[string]fileOwner, owner fileOwner) {
-	if key == "" {
-		return
-	}
-	if existing, ok := m[key]; ok {
-		if existing.hash != owner.hash || existing.fileID != owner.fileID {
-			existing.ambiguous = true
-			m[key] = existing
-		}
-		return
-	}
-	m[key] = owner
-}
-
-func (idx *ownershipIndex) lookup(abs string, info os.FileInfo) (fileOwner, bool) {
-	if idx == nil {
-		return fileOwner{}, false
-	}
-	if key := inodeKey(info); key != "" {
-		if owner, ok := idx.byInode[key]; ok {
-			return owner, true
-		}
-	}
-	if owner, ok := idx.byPath[filepath.Clean(abs)]; ok {
-		return owner, true
-	}
-	return fileOwner{}, false
-}
-
-func (q *qbit) ownership() (*ownershipIndex, error) {
-	var torrents []qbTorrent
-	if err := q.getJSON("/api/v2/torrents/info", &torrents); err != nil {
-		return nil, err
-	}
-	idx := &ownershipIndex{
-		byInode: make(map[string]fileOwner),
-		byPath:  make(map[string]fileOwner),
-	}
-	for _, t := range torrents {
-		files, err := q.files(t.Hash)
-		if err != nil {
-			return nil, err
-		}
-		for i := range files {
-			f := &files[i]
-			id := i
-			if f.Index != nil {
-				id = *f.Index
-			}
-			if t.SavePath == "" || f.Name == "" || filepath.IsAbs(f.Name) {
-				continue
-			}
-			abs := filepath.Clean(filepath.Join(t.SavePath, filepath.FromSlash(f.Name)))
-			owner := fileOwner{hash: t.Hash, fileID: id, priority: f.Priority, progress: f.Progress}
-			idx.put(abs, idx.byPath, owner)
-			if info, err := os.Stat(abs); err == nil {
-				idx.put(inodeKey(info), idx.byInode, owner)
-			}
-		}
-	}
-	return idx, nil
 }
 
 type streamRegistry struct {
@@ -176,7 +97,6 @@ func (t *lockTable) lock(key string) func() {
 const contractVersion = 1
 
 type healthStatus struct {
-	OK       bool              `json:"ok"`
 	Version  string            `json:"version"`
 	Contract int               `json:"contract"`
 	Checks   map[string]string `json:"checks"`

@@ -1,0 +1,619 @@
+package main
+
+import (
+	"errors"
+	"fmt"
+	"io"
+	"io/fs"
+	"log"
+	"net/http"
+	"os"
+	"path/filepath"
+	"sort"
+	"strings"
+	"syscall"
+	"time"
+)
+
+type trimResult struct {
+	logicalSize int64
+	retained    int64
+	freed       int64
+}
+
+type deleteTarget struct {
+	rel     string
+	abs     string
+	info    os.FileInfo
+	match   qbMatch
+	waiters []chan *deleteBatchOutcome
+}
+
+type deleteBatch struct {
+	generation uint64
+	timer      *time.Timer
+	targets    map[string]*deleteTarget
+}
+
+type deleteBatchOutcome struct {
+	status   int
+	err      string
+	response map[string]any
+
+	perTarget map[string]*deleteBatchOutcome
+}
+
+func (o *deleteBatchOutcome) forTarget(rel string) *deleteBatchOutcome {
+	if o != nil && o.perTarget != nil {
+		if own, ok := o.perTarget[rel]; ok {
+			return own
+		}
+	}
+	return o
+}
+
+type preparedDelete struct {
+	target   *deleteTarget
+	file     *os.File
+	info     os.FileInfo
+	priority int
+	size     int64
+}
+
+func allocatedBytes(info os.FileInfo) int64 {
+	if st, ok := info.Sys().(*syscall.Stat_t); ok {
+		return st.Blocks * 512
+	}
+	return info.Size()
+}
+
+func readAtFull(f *os.File, p []byte, off int64) error {
+	n, err := f.ReadAt(p, off)
+	if err != nil && !errors.Is(err, io.EOF) {
+		return err
+	}
+	if n != len(p) {
+		return io.ErrUnexpectedEOF
+	}
+	return nil
+}
+
+var errTooSmallToTrim = errors.New("file fits in two pieces; boundary data is shared with neighbours")
+
+func trimSparseFile(f *os.File, expected os.FileInfo, pieceSize int64) (trimResult, error) {
+	if pieceSize <= 0 || pieceSize > 64<<20 {
+		return trimResult{}, fmt.Errorf("unsafe piece size %d", pieceSize)
+	}
+	current, err := f.Stat()
+	if err != nil {
+		return trimResult{}, err
+	}
+	if !current.Mode().IsRegular() || !os.SameFile(expected, current) {
+		return trimResult{}, errors.New("file changed while delete was prepared")
+	}
+	size := current.Size()
+	before := allocatedBytes(current)
+
+	if size <= 2*pieceSize {
+		return trimResult{}, errTooSmallToTrim
+	}
+
+	prefix := make([]byte, int(pieceSize))
+	suffix := make([]byte, int(pieceSize))
+	suffixOff := size - pieceSize
+	if err := readAtFull(f, prefix, 0); err != nil {
+		return trimResult{}, fmt.Errorf("read prefix: %w", err)
+	}
+	if err := readAtFull(f, suffix, suffixOff); err != nil {
+		return trimResult{}, fmt.Errorf("read suffix: %w", err)
+	}
+
+	if err := f.Truncate(0); err != nil {
+		return trimResult{}, fmt.Errorf("truncate to zero: %w", err)
+	}
+	if err := f.Truncate(size); err != nil {
+		return trimResult{}, fmt.Errorf("restore logical size: %w", err)
+	}
+	if len(prefix) > 0 {
+		if _, err := f.WriteAt(prefix, 0); err != nil {
+			return trimResult{}, fmt.Errorf("restore prefix: %w", err)
+		}
+		if _, err := f.WriteAt(suffix, suffixOff); err != nil {
+			return trimResult{}, fmt.Errorf("restore suffix: %w", err)
+		}
+	}
+	if err := f.Sync(); err != nil {
+		return trimResult{}, fmt.Errorf("sync: %w", err)
+	}
+	afterInfo, err := f.Stat()
+	if err != nil {
+		return trimResult{}, err
+	}
+	after := allocatedBytes(afterInfo)
+	freed := before - after
+	if freed < 0 {
+		freed = 0
+	}
+	return trimResult{logicalSize: size, retained: int64(len(prefix) + len(suffix)), freed: freed}, nil
+}
+
+func (s *server) awaitDelete(target *deleteTarget) *deleteBatchOutcome {
+	result := make(chan *deleteBatchOutcome, 1)
+	target.waiters = []chan *deleteBatchOutcome{result}
+	s.enqueueTorrentDelete(target)
+	outcome := <-result
+	return outcome.forTarget(target.rel)
+}
+
+func (s *server) cancelQueuedDelete(hash string, fileID int) bool {
+	s.deleteMu.Lock()
+	batch := s.deleteBatches[hash]
+	if batch == nil {
+		s.deleteMu.Unlock()
+		return false
+	}
+	var cancelled *deleteTarget
+	for rel, target := range batch.targets {
+		if target.match.fileID == fileID {
+			cancelled = target
+			delete(batch.targets, rel)
+			break
+		}
+	}
+	if cancelled != nil && len(batch.targets) == 0 {
+		if batch.timer != nil {
+			batch.timer.Stop()
+		}
+		delete(s.deleteBatches, hash)
+	}
+	s.deleteMu.Unlock()
+
+	if cancelled == nil {
+		return false
+	}
+	outcome := deleteBatchError(http.StatusConflict,
+		"queued delete for %q was cancelled by an enable request", cancelled.rel)
+	for _, waiter := range cancelled.waiters {
+		waiter <- outcome
+	}
+	log.Printf("delete: queued %s cancelled by enable (torrent=%s file=%d)", cancelled.rel, hash, fileID)
+	return true
+}
+
+func (s *server) pendingBatch(hash string) bool {
+	s.deleteMu.Lock()
+	defer s.deleteMu.Unlock()
+	return s.deleteBatches[hash] != nil
+}
+
+func (s *server) cancelAllQueuedDeletes() {
+	s.deleteMu.Lock()
+	batches := s.deleteBatches
+	s.deleteBatches = nil
+	s.deleteMu.Unlock()
+
+	for _, batch := range batches {
+		if batch.timer != nil {
+			batch.timer.Stop()
+		}
+		outcome := deleteBatchError(http.StatusServiceUnavailable,
+			"torrmedia is shutting down; nothing was deleted, retry after restart")
+		for _, target := range batch.targets {
+			for _, waiter := range target.waiters {
+				waiter <- outcome
+			}
+		}
+	}
+}
+
+func (s *server) enqueueTorrentDelete(target *deleteTarget) {
+	debounce := s.deleteDebounce
+	if debounce <= 0 {
+		debounce = 30 * time.Second
+	}
+
+	s.deleteMu.Lock()
+	if s.deleteBatches == nil {
+		s.deleteBatches = make(map[string]*deleteBatch)
+	}
+	batch := s.deleteBatches[target.match.hash]
+	if batch == nil {
+		batch = &deleteBatch{targets: make(map[string]*deleteTarget)}
+		s.deleteBatches[target.match.hash] = batch
+	}
+	if existing := batch.targets[target.rel]; existing != nil {
+		existing.waiters = append(existing.waiters, target.waiters...)
+	} else {
+		batch.targets[target.rel] = target
+	}
+
+	// Generation makes an already-fired stale timer harmless if a new DELETE
+	// arrived while its callback was waiting for deleteMu.
+	batch.generation++
+	generation := batch.generation
+	if batch.timer != nil {
+		batch.timer.Stop()
+	}
+	batch.timer = time.AfterFunc(debounce, func() {
+		s.flushDeleteBatch(target.match.hash, batch, generation)
+	})
+	queued := len(batch.targets)
+	s.deleteMu.Unlock()
+
+	log.Printf("delete: queued %s (torrent=%s batch=%d debounce=%s)",
+		target.rel, target.match.hash, queued, debounce)
+}
+
+func (s *server) flushDeleteBatch(hash string, batch *deleteBatch, generation uint64) {
+	s.deleteMu.Lock()
+	if s.deleteBatches[hash] != batch || batch.generation != generation {
+		s.deleteMu.Unlock()
+		return
+	}
+	delete(s.deleteBatches, hash)
+	targets := make([]*deleteTarget, 0, len(batch.targets))
+	for _, target := range batch.targets {
+		targets = append(targets, target)
+	}
+	s.deleteMu.Unlock()
+
+	sort.Slice(targets, func(i, j int) bool {
+		if targets[i].match.fileID == targets[j].match.fileID {
+			return targets[i].rel < targets[j].rel
+		}
+		return targets[i].match.fileID < targets[j].match.fileID
+	})
+	s.inflight.Add(1)
+	defer s.inflight.Done()
+	outcome := s.deleteTorrentBatch(hash, targets)
+	for _, target := range targets {
+		own := outcome.forTarget(target.rel)
+		for _, waiter := range target.waiters {
+			waiter <- own
+		}
+	}
+}
+
+func deleteBatchError(status int, format string, args ...any) *deleteBatchOutcome {
+	return &deleteBatchOutcome{
+		status: status,
+		err:    fmt.Sprintf(format, args...),
+	}
+}
+
+func closePreparedDeletes(prepared []*preparedDelete) {
+	for _, item := range prepared {
+		if item.file != nil {
+			_ = item.file.Close()
+		}
+	}
+}
+
+func (s *server) rollbackDeletePriorities(hash string, changed []*preparedDelete) []string {
+	var failures []string
+	for i := len(changed) - 1; i >= 0; i-- {
+		if err := s.qb.setFilePrio(hash, changed[i].target.match.fileID, changed[i].priority); err != nil {
+			failures = append(failures, fmt.Sprintf("file %d: %v", changed[i].target.match.fileID, err))
+		}
+	}
+	if len(failures) > 0 {
+		log.Printf("delete batch: rollback of priorities for %s failed: %s", hash, strings.Join(failures, "; "))
+	}
+	return failures
+}
+
+func rollbackNote(failures []string) string {
+	if len(failures) == 0 {
+		return "priorities rolled back"
+	}
+	return "ROLLBACK INCOMPLETE (" + strings.Join(failures, "; ") + ")"
+}
+
+func (s *server) deleteTorrentBatch(hash string, targets []*deleteTarget) *deleteBatchOutcome {
+	if len(targets) == 0 {
+		return deleteBatchError(http.StatusBadRequest, "empty delete batch")
+	}
+
+	unlock := s.lockTorrent(hash)
+	defer unlock()
+
+	deadline := time.Now().Add(s.operationTimeout)
+	budget := func() (time.Duration, error) {
+		left := time.Until(deadline)
+		if left <= 0 {
+			return 0, fmt.Errorf("operation deadline of %s exceeded", s.operationTimeout)
+		}
+		return left, nil
+	}
+
+	torrent, err := s.qb.torrent(hash)
+	if err != nil {
+		status := http.StatusBadGateway
+		if errors.Is(err, errTorrentNotFound) {
+			status = http.StatusNotFound
+		}
+		return deleteBatchError(status, "qbittorrent refresh failed, nothing deleted: %v", err)
+	}
+	if qbitCheckingState(torrent.State) {
+		return deleteBatchError(http.StatusConflict,
+			"torrent is checking, nothing deleted")
+	}
+	props, err := s.qb.properties(hash)
+	if err != nil {
+		return deleteBatchError(http.StatusBadGateway,
+			"qbittorrent properties failed, nothing deleted: %v", err)
+	}
+	files, err := s.qb.files(hash)
+	if err != nil {
+		return deleteBatchError(http.StatusBadGateway,
+			"qbittorrent files failed, nothing deleted: %v", err)
+	}
+
+	prepared := make([]*preparedDelete, 0, len(targets))
+	rejected := make(map[string]*deleteBatchOutcome)
+	seenIDs := make(map[int]string, len(targets))
+	reject := func(target *deleteTarget, status int, format string, args ...any) {
+		rejected[target.rel] = deleteBatchError(status, format, args...)
+	}
+	for _, target := range targets {
+		if target.match.hash != hash {
+			reject(target, http.StatusConflict, "file %q belongs to another torrent", target.rel)
+			continue
+		}
+		if previous, exists := seenIDs[target.match.fileID]; exists {
+			reject(target, http.StatusConflict,
+				"torrent file id %d is referenced by both %q and %q",
+				target.match.fileID, previous, target.rel)
+			continue
+		}
+		seenIDs[target.match.fileID] = target.rel
+
+		qbFile, ok := qbFileByID(files, target.match.fileID)
+		if !ok {
+			reject(target, http.StatusConflict, "torrent file id %d disappeared", target.match.fileID)
+			continue
+		}
+		currentAbs, err := s.torrentFilePath(torrent, qbFile)
+		if err != nil || filepath.Clean(currentAbs) != filepath.Clean(target.match.abs) {
+			reject(target, http.StatusConflict,
+				"torrent path for file id %d changed", target.match.fileID)
+			continue
+		}
+		currentRel, err := filepath.Rel(s.root, currentAbs)
+		if err != nil {
+			reject(target, http.StatusForbidden, "torrent file %q is outside torrmedia root", target.rel)
+			continue
+		}
+		currentInfo, err := os.Stat(currentAbs)
+		if errors.Is(err, fs.ErrNotExist) {
+			prepared = append(prepared, &preparedDelete{
+				target: target, priority: qbFile.Priority, size: qbFile.Size,
+			})
+			continue
+		}
+		if err != nil || !currentInfo.Mode().IsRegular() {
+			reject(target, http.StatusConflict, "torrent path for %q is not a regular file", target.rel)
+			continue
+		}
+		if target.info != nil && !os.SameFile(target.info, currentInfo) {
+			reject(target, http.StatusConflict, "torrent inode for %q changed", target.rel)
+			continue
+		}
+		root := s.fsRoot()
+		if root == nil {
+			reject(target, http.StatusInternalServerError, "media root %q is not available", s.root)
+			continue
+		}
+		f, err := root.OpenFile(filepath.ToSlash(currentRel), os.O_RDWR, 0)
+		if err != nil {
+			reject(target, http.StatusInternalServerError, "open %q: %v", target.rel, err)
+			continue
+		}
+		pinnedInfo, err := f.Stat()
+		if err != nil || !pinnedInfo.Mode().IsRegular() ||
+			!os.SameFile(currentInfo, pinnedInfo) {
+			_ = f.Close()
+			reject(target, http.StatusConflict, "file %q changed while delete was prepared", target.rel)
+			continue
+		}
+		if s.streamReg().active(inodeKey(pinnedInfo)) {
+			_ = f.Close()
+			reject(target, http.StatusConflict, "file %q is being streamed right now", target.rel)
+			continue
+		}
+		prepared = append(prepared, &preparedDelete{
+			target: target, file: f, info: pinnedInfo,
+			priority: qbFile.Priority, size: qbFile.Size,
+		})
+	}
+	defer closePreparedDeletes(prepared)
+
+	if len(prepared) == 0 {
+		out := deleteBatchError(http.StatusConflict, "no valid files in delete batch, nothing deleted")
+		out.perTarget = rejected
+		return out
+	}
+
+	warnings := []string{}
+
+	wasRunning := !qbitStoppedState(torrent.State)
+	if wasRunning {
+		if err := s.qb.switchTorrent(hash, "stop"); err != nil {
+			out := deleteBatchError(http.StatusBadGateway,
+				"qbittorrent stop failed, nothing deleted: %v", err)
+			out.perTarget = rejected
+			return out
+		}
+		left, err := budget()
+		if err == nil {
+			err = s.qb.waitStopped(hash, left, s.pollInterval)
+		}
+		if err != nil {
+			_ = s.qb.switchTorrent(hash, "start")
+			out := deleteBatchError(http.StatusGatewayTimeout,
+				"qbittorrent did not stop, nothing deleted: %v", err)
+			out.perTarget = rejected
+			return out
+		}
+	}
+
+	changed := make([]*preparedDelete, 0, len(prepared))
+	for _, item := range prepared {
+		if item.priority == 0 {
+			continue
+		}
+		changed = append(changed, item)
+		abort := func(status int, format string, args ...any) *deleteBatchOutcome {
+			note := rollbackNote(s.rollbackDeletePriorities(hash, changed))
+			if wasRunning {
+				if err := s.qb.switchTorrent(hash, "start"); err != nil {
+					note += fmt.Sprintf("; restart failed: %v", err)
+				}
+			}
+			out := deleteBatchError(status, format+"; %s", append(args, note)...)
+			out.perTarget = rejected
+			return out
+		}
+		if err := s.qb.setFilePrio(hash, item.target.match.fileID, 0); err != nil {
+			return abort(http.StatusBadGateway, "qbittorrent filePrio failed, nothing trimmed: %v", err)
+		}
+		left, err := budget()
+		if err == nil {
+			err = s.qb.waitFilePriority(hash, item.target.match.fileID, 0, left, s.pollInterval)
+		}
+		if err != nil {
+			return abort(http.StatusGatewayTimeout, "qbittorrent did not accept priority=0, nothing trimmed: %v", err)
+		}
+	}
+
+	type deletedFile struct {
+		path    string
+		trimmed trimResult
+		absent  bool
+		kept    bool
+	}
+	deleted := make([]deletedFile, 0, len(prepared))
+	for _, item := range prepared {
+		if item.file == nil {
+			deleted = append(deleted, deletedFile{
+				path: item.target.rel,
+				trimmed: trimResult{
+					logicalSize: item.size,
+				},
+				absent: true,
+			})
+			continue
+		}
+		trimmed, err := trimSparseFile(item.file, item.info, props.PieceSize)
+		if errors.Is(err, errTooSmallToTrim) {
+			warnings = append(warnings, fmt.Sprintf(
+				"%s: excluded from the torrent, but data kept on disk (%v)", item.target.rel, err))
+			deleted = append(deleted, deletedFile{
+				path:    item.target.rel,
+				trimmed: trimResult{logicalSize: item.size},
+				kept:    true,
+			})
+			continue
+		}
+		if err != nil {
+			note := "torrent left stopped"
+			if rcErr := s.qb.recheck(hash); rcErr != nil {
+				note = fmt.Sprintf("recheck also failed: %v", rcErr)
+			} else if wasRunning {
+				if startErr := s.qb.switchTorrent(hash, "start"); startErr != nil {
+					note = fmt.Sprintf("restart failed: %v", startErr)
+				} else {
+					note = "torrent restarted to repair neighbouring pieces"
+				}
+			}
+			out := deleteBatchError(http.StatusInternalServerError,
+				"batch trim failed at %q with selected priorities=0; %s: %v",
+				item.target.rel, note, err)
+			out.perTarget = rejected
+			return out
+		}
+		deleted = append(deleted, deletedFile{path: item.target.rel, trimmed: trimmed})
+	}
+	if err := s.qb.recheck(hash); err != nil {
+		out := deleteBatchError(http.StatusBadGateway,
+			"files trimmed, but qbittorrent recheck failed; torrent left stopped: %v", err)
+		out.perTarget = rejected
+		return out
+	}
+	left, err := budget()
+	if err == nil {
+		err = s.qb.waitRecheck(hash, prepared[0].target.match.fileID, left, s.pollInterval)
+	}
+	if err != nil {
+		out := deleteBatchError(http.StatusGatewayTimeout,
+			"files trimmed, but qbittorrent recheck did not finish; torrent left stopped: %v", err)
+		out.perTarget = rejected
+		return out
+	}
+
+	fileResponses := make([]map[string]any, 0, len(deleted))
+	var totalFreed, totalRetained int64
+	for _, item := range deleted {
+		totalFreed += item.trimmed.freed
+		totalRetained += item.trimmed.retained
+		fileResponse := map[string]any{
+			"path": item.path, "logical_size": item.trimmed.logicalSize,
+			"retained_boundary_bytes": item.trimmed.retained,
+			"freed_bytes_estimate":    item.trimmed.freed,
+		}
+		if item.absent {
+			fileResponse["was_absent"] = true
+		}
+		if item.kept {
+			fileResponse["data_kept"] = true
+		}
+		fileResponses = append(fileResponses, fileResponse)
+	}
+	resp := map[string]any{
+		"torrent": hash, "batch_size": len(deleted), "batch_deleted": fileResponses,
+		"storage_trimmed": true, "freed_bytes_estimate": totalFreed,
+		"retained_boundary_bytes": totalRetained, "recheck": "complete",
+	}
+	if wasRunning {
+		if err := s.qb.switchTorrent(hash, "start"); err != nil {
+			warnings = append(warnings, fmt.Sprintf("torrent was not restarted: %v", err))
+			log.Printf("delete batch: restart %s failed after successful trim: %v", hash, err)
+		} else {
+			resp["torrent_restarted"] = true
+		}
+	}
+	resp["warnings"] = warnings
+	log.Printf("delete batch: torrent=%s files=%d freed=%d retained=%d warnings=%d",
+		hash, len(deleted), totalFreed, totalRetained, len(warnings))
+	return &deleteBatchOutcome{status: http.StatusOK, response: resp, perTarget: rejected}
+}
+
+func (s *server) torrentFilePath(t *qbTorrent, f *qbFile) (string, error) {
+	if t.SavePath == "" || f.Name == "" || filepath.IsAbs(f.Name) {
+		return "", errors.New("invalid torrent file path")
+	}
+	abs := filepath.Clean(filepath.Join(t.SavePath, filepath.FromSlash(f.Name)))
+	rel, err := filepath.Rel(s.root, abs)
+	if err != nil || rel == ".." || strings.HasPrefix(rel, "../") {
+		return "", errors.New("torrent file is outside torrmedia root")
+	}
+	return abs, nil
+}
+
+func requiredFileBytes(path string, logicalSize int64) (int64, error) {
+	info, err := os.Stat(path)
+	if errors.Is(err, fs.ErrNotExist) {
+		return logicalSize, nil
+	}
+	if err != nil {
+		return 0, err
+	}
+	if !info.Mode().IsRegular() {
+		return 0, errors.New("torrent path is not a regular file")
+	}
+	required := logicalSize - allocatedBytes(info)
+	if required < 0 {
+		required = 0
+	}
+	return required, nil
+}

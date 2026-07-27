@@ -178,6 +178,8 @@ func defaultPlaybackConfig() playbackConfig {
 	}
 }
 
+var errBadPath = errors.New("bad path")
+
 func cleanRelative(rel string) (string, error) {
 	if rel == "" || strings.ContainsRune(rel, 0) || filepath.IsAbs(rel) {
 		return "", errBadPath
@@ -197,131 +199,60 @@ func itemForPath(rel string) string {
 	return filepath.FromSlash(strings.Join(parts[:2], "/"))
 }
 
-func (s *server) enrichViewed(items []item) {
-	if s.viewed == nil {
-		return
-	}
-	viewed := s.viewed.snapshot()
-	for i := range items {
-		for j := range items[i].Files {
-			entry, ok := viewed[items[i].Files[j].Path]
-			if !ok || entry.State == "" {
-				continue
-			}
-			items[i].Files[j].Watch = entry.State
-			items[i].Files[j].Pos = entry.Pos
-		}
-	}
-}
-
 func (s *server) viewedSize(rel string) int64 {
-	abs, err := s.resolve(rel)
-	if err != nil {
-		return 0
-	}
-	info, err := os.Stat(abs)
+	info, err := os.Stat(filepath.Join(s.root, rel))
 	if err != nil || !info.Mode().IsRegular() {
 		return 0
 	}
 	return info.Size()
 }
 
-func (s *server) handleViewed(w http.ResponseWriter, r *http.Request) {
-	if s.viewed == nil {
-		writeErr(w, http.StatusInternalServerError, "viewed store is not configured")
-		return
-	}
-	pathRaw := r.URL.Query().Get("path")
-	itemRaw := r.URL.Query().Get("item")
-	var path, item string
-	var err error
-	if pathRaw != "" {
-		if path, err = cleanRelative(pathRaw); err != nil {
-			writeErr(w, http.StatusBadRequest, "path %q: %v", pathRaw, err)
-			return
+func (s *server) markViewed(shelfRel, state string) error {
+	rel := filepath.FromSlash(shelfRel)
+	size := s.viewedSize(rel)
+	now := time.Now().Unix()
+	return s.viewed.update(func(items map[string]viewedEntry) {
+		entry := items[rel]
+		entry.Path = rel
+		entry.Item = itemForPath(rel)
+		if size > 0 {
+			entry.Size = size
 		}
-	}
-	if itemRaw != "" {
-		if item, err = cleanRelative(itemRaw); err != nil {
-			writeErr(w, http.StatusBadRequest, "item %q: %v", itemRaw, err)
-			return
-		}
-	}
+		entry.State = state
+		entry.Manual = true
+		entry.Updated = now
+		items[rel] = entry
+	})
+}
 
-	switch r.Method {
-	case http.MethodGet:
-		writeJSON(w, http.StatusOK, map[string]any{
-			"ok": true, "items": s.viewed.list(path, item),
-		})
-	case http.MethodPost:
-		if path == "" || item != "" {
-			writeErr(w, http.StatusBadRequest, "exactly one path is required")
-			return
+func (s *server) clearViewedFile(shelfRel string) error {
+	rel := filepath.FromSlash(shelfRel)
+	now := time.Now().Unix()
+	return s.viewed.update(func(items map[string]viewedEntry) {
+		entry := items[rel]
+		entry.Path = rel
+		entry.Item = itemForPath(rel)
+		if entry.Size == 0 {
+			entry.Size = s.viewedSize(rel)
 		}
-		state := r.URL.Query().Get("state")
-		if state == "" {
-			state = "watched"
-		}
-		if state != "started" && state != "watched" {
-			writeErr(w, http.StatusBadRequest, "unknown state %q", state)
-			return
-		}
-		now := time.Now().Unix()
-		size := s.viewedSize(path)
-		err := s.viewed.update(func(items map[string]viewedEntry) {
-			entry := items[path]
-			entry.Path = path
-			entry.Item = itemForPath(path)
-			if size > 0 {
-				entry.Size = size
+		entry.State = ""
+		entry.Manual = true
+		entry.Served = 0
+		entry.Pos = 0
+		entry.Updated = now
+		items[rel] = entry
+	})
+}
+
+func (s *server) clearViewedItem(shelfRel string) error {
+	prefix := filepath.FromSlash(shelfRel)
+	return s.viewed.update(func(items map[string]viewedEntry) {
+		for path := range items {
+			if path == prefix || strings.HasPrefix(path, prefix+string(filepath.Separator)) {
+				delete(items, path)
 			}
-			entry.State = state
-			entry.Manual = true
-			entry.Updated = now
-			items[path] = entry
-		})
-		if err != nil {
-			writeErr(w, http.StatusInternalServerError, "save viewed: %v", err)
-			return
 		}
-		writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
-	case http.MethodDelete:
-		if (path == "") == (item == "") {
-			writeErr(w, http.StatusBadRequest, "exactly one path or item is required")
-			return
-		}
-		now := time.Now().Unix()
-		err := s.viewed.update(func(items map[string]viewedEntry) {
-			if path != "" {
-				entry := items[path]
-				entry.Path = path
-				entry.Item = itemForPath(path)
-				if entry.Size == 0 {
-					entry.Size = s.viewedSize(path)
-				}
-				entry.State = ""
-				entry.Manual = true
-				entry.Served = 0
-				entry.Pos = 0
-				entry.Updated = now
-				items[path] = entry
-				return
-			}
-			for entryPath, entry := range items {
-				if entry.Item == item {
-					delete(items, entryPath)
-				}
-			}
-		})
-		if err != nil {
-			writeErr(w, http.StatusInternalServerError, "save viewed: %v", err)
-			return
-		}
-		writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
-	default:
-		w.Header().Set("Allow", http.MethodGet+", "+http.MethodPost+", "+http.MethodDelete)
-		writeErr(w, http.StatusMethodNotAllowed, "method %s is not allowed", r.Method)
-	}
+	})
 }
 
 type playbackTracker struct {
