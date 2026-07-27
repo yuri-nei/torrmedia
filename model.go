@@ -43,24 +43,25 @@ type apiTransfer struct {
 }
 
 type apiItem struct {
-	ID         string      `json:"id"`
-	Title      string      `json:"title"`
-	Status     string      `json:"status"`
-	Progress   float64     `json:"progress"`
-	Size       int64       `json:"size"`
-	Downloaded int64       `json:"downloaded"`
-	FilesTotal int         `json:"files_total"`
-	FilesReady int         `json:"files_ready"`
-	Category   *string     `json:"category"`
-	AddedAt    int64       `json:"added_at"`
-	Transfer   apiTransfer `json:"transfer"`
-	Actions    []string    `json:"actions"`
+	ID           string      `json:"id"`
+	Title        string      `json:"title"`
+	Status       string      `json:"status"`
+	Progress     float64     `json:"progress"`
+	Size         int64       `json:"size"`
+	Downloaded   int64       `json:"downloaded"`
+	FilesTotal   int         `json:"files_total"`
+	FilesReady   int         `json:"files_ready"`
+	FilesWatched int         `json:"files_watched"`
+	Category     *string     `json:"category"`
+	Magnet       *string     `json:"magnet"`
+	AddedAt      int64       `json:"added_at"`
+	Transfer     apiTransfer `json:"transfer"`
+	Actions      []string    `json:"actions"`
 }
 
 type apiItemDetail struct {
 	apiItem
-	Magnet *string   `json:"magnet"`
-	Files  []apiFile `json:"files"`
+	Files []apiFile `json:"files"`
 }
 
 type apiFile struct {

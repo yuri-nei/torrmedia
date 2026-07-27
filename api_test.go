@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"strings"
 	"testing"
+	"time"
 )
 
 func decodeJSON[T any](t *testing.T, body []byte) T {
@@ -34,21 +35,35 @@ func TestItemsExposeNoInternals(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status=%d body=%s", rec.Code, rec.Body)
 	}
+	list := decodeJSON[apiItemList](t, rec.Body.Bytes())
+
 	body := rec.Body.String()
+	if list.Items[0].Magnet != nil {
+		encoded, err := json.Marshal(*list.Items[0].Magnet)
+		if err != nil {
+			t.Fatal(err)
+		}
+		body = strings.ReplaceAll(body, strings.Trim(string(encoded), `"`), "<magnet>")
+	}
 	for _, leak := range []string{
 		env.fake.torrents[0].hash, env.root, "stoppedUP", "qbit_file_id", "torrent_hash",
 	} {
 		if strings.Contains(body, leak) {
-			t.Fatalf("response leaks %q: %s", leak, body)
+			t.Fatalf("response leaks %q outside the magnet: %s", leak, body)
 		}
 	}
-	list := decodeJSON[apiItemList](t, rec.Body.Bytes())
 	if len(list.Items) != 1 || list.Degraded != nil {
 		t.Fatalf("list=%+v", list)
 	}
 	item := list.Items[0]
 	if item.Status != statusStopped || item.FilesTotal != 2 || item.FilesReady != 2 {
 		t.Fatalf("item=%+v", item)
+	}
+	if item.Magnet == nil || !strings.HasPrefix(*item.Magnet, "magnet:?") {
+		t.Fatalf("magnet=%v", item.Magnet)
+	}
+	if item.FilesWatched != 0 {
+		t.Fatalf("files_watched=%d", item.FilesWatched)
 	}
 }
 
@@ -58,9 +73,6 @@ func TestItemDetailAndStream(t *testing.T) {
 
 	rec := env.do(t, http.MethodGet, "/items/"+item.id, "")
 	detail := decodeJSON[apiItemDetail](t, rec.Body.Bytes())
-	if detail.Magnet == nil || !strings.HasPrefix(*detail.Magnet, "magnet:?") {
-		t.Fatalf("magnet=%v", detail.Magnet)
-	}
 	if len(detail.Files) != 2 {
 		t.Fatalf("files=%d", len(detail.Files))
 	}
@@ -215,5 +227,36 @@ func TestCategoriesErrorIsNotAnEmptyList(t *testing.T) {
 	}
 	if decodeJSON[apiError](t, rec.Body.Bytes()).Code != codeQbitUnavailable {
 		t.Fatalf("body=%s", rec.Body)
+	}
+}
+
+func TestAddOperationIsVisibleInTheListStream(t *testing.T) {
+	env := newTestEnv(t)
+	sub := env.hub().subscribe(topicList)
+	defer env.hub().unsubscribe(sub)
+
+	rec := env.do(t, http.MethodPost, "/items", `{"magnet":"magnet:?xt=urn:btih:abc"}`)
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body)
+	}
+	op := decodeJSON[operation](t, rec.Body.Bytes())
+	if op.Item != "" {
+		t.Fatalf("add operation is bound to item %q", op.Item)
+	}
+	env.awaitOperation(t, op.ID)
+
+	deadline := time.After(2 * time.Second)
+	for {
+		select {
+		case frame := <-sub.ch:
+			if frame.event != eventOperation {
+				continue
+			}
+			if got := decodeJSON[operation](t, frame.data); got.ID == op.ID {
+				return
+			}
+		case <-deadline:
+			t.Fatal("add operation never appeared in the list stream")
+		}
 	}
 }

@@ -18,10 +18,13 @@ func (s *server) renderList(cat *catalog) apiItemList {
 }
 
 func (s *server) renderItem(cat *catalog, item *catalogItem) apiItem {
-	ready := 0
+	ready, watched := 0, 0
 	for _, f := range item.files {
 		if f.status == fileReady {
 			ready++
+		}
+		if f.watch == watchWatched {
+			watched++
 		}
 	}
 	status := item.status
@@ -31,8 +34,9 @@ func (s *server) renderItem(cat *catalog, item *catalogItem) apiItem {
 	return apiItem{
 		ID: item.id, Title: item.title, Status: status,
 		Progress: item.progress, Size: item.size, Downloaded: item.downloaded,
-		FilesTotal: len(item.files), FilesReady: ready,
-		Category: nilIfEmpty(item.category), AddedAt: item.addedAt,
+		FilesTotal: len(item.files), FilesReady: ready, FilesWatched: watched,
+		Category: nilIfEmpty(item.category), Magnet: nilIfEmpty(item.magnet),
+		AddedAt:  item.addedAt,
 		Transfer: item.transfer,
 		Actions:  s.itemActionList(cat, item),
 	}
@@ -53,11 +57,7 @@ func (s *server) renderDetail(cat *catalog, item *catalogItem) apiItemDetail {
 			Actions: s.fileActionList(cat, item, f),
 		})
 	}
-	return apiItemDetail{
-		apiItem: s.renderItem(cat, item),
-		Magnet:  nilIfEmpty(item.magnet),
-		Files:   files,
-	}
+	return apiItemDetail{apiItem: s.renderItem(cat, item), Files: files}
 }
 
 func (s *server) fileAbs(f *catalogFile) (string, bool) {
