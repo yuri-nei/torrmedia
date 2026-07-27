@@ -42,12 +42,13 @@ func (s *server) renderDetail(cat *catalog, item *catalogItem) apiItemDetail {
 	files := make([]apiFile, 0, len(item.files))
 	for i := range item.files {
 		f := &item.files[i]
-		if f.shelfRel == "" && f.status == fileReady {
-			f.status = filePartial
+		status := f.status
+		if f.shelfRel == "" && status == fileReady {
+			status = filePartial
 		}
 		files = append(files, apiFile{
 			ID: f.id, Name: f.name, Path: f.rel, Size: f.size,
-			Progress: f.progress, Status: f.status,
+			Progress: f.progress, Status: status,
 			Watch: nilIfEmpty(f.watch), Position: f.position,
 			Actions: s.fileActionList(cat, item, f),
 		})

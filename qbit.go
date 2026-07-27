@@ -289,7 +289,7 @@ func (q *qbit) switchTorrent(hash, action string) error {
 
 func pollUntil(timeout, interval time.Duration, check func() (bool, error)) error {
 	if timeout <= 0 {
-		timeout = 10 * time.Minute
+		return errors.New("operation deadline exceeded")
 	}
 	if interval <= 0 {
 		interval = 250 * time.Millisecond

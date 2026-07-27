@@ -296,12 +296,8 @@ func (s *server) handleFileViewedSet(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, codeBadRequest, "unknown state %q", body.State)
 		return
 	}
-	if d := s.permitFile(cat, item, file, actionSetViewed); d != nil && body.State == watchWatched {
+	if d := s.permitFile(cat, item, file, actionSetViewed); d != nil {
 		writeDenial(w, d)
-		return
-	}
-	if file.shelfRel == "" {
-		writeErr(w, http.StatusConflict, codeNotFound, "file is not on the shelf")
 		return
 	}
 	if err := s.markViewed(file.shelfRel, body.State); err != nil {
@@ -313,12 +309,12 @@ func (s *server) handleFileViewedSet(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *server) handleFileViewedClear(w http.ResponseWriter, r *http.Request) {
-	_, _, file, ok := s.resolveFile(w, r)
+	cat, item, file, ok := s.resolveFile(w, r)
 	if !ok {
 		return
 	}
-	if file.shelfRel == "" {
-		writeErr(w, http.StatusConflict, codeNotFound, "file is not on the shelf")
+	if d := s.permitFile(cat, item, file, actionClearViewed); d != nil {
+		writeDenial(w, d)
 		return
 	}
 	if err := s.clearViewedFile(file.shelfRel); err != nil {

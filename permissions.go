@@ -60,11 +60,14 @@ func (s *server) permitFile(cat *catalog, item *catalogItem, file *catalogFile, 
 		}
 		return nil
 	case actionSetViewed:
-		if file.watch == watchWatched {
-			return deny(http.StatusConflict, codeBadRequest, "file is already marked watched")
+		if file.shelfRel == "" {
+			return deny(http.StatusConflict, codeNotFound, "file is not on the shelf")
 		}
 		return nil
 	case actionClearViewed:
+		if file.shelfRel == "" {
+			return deny(http.StatusConflict, codeNotFound, "file is not on the shelf")
+		}
 		if file.watch == "" {
 			return deny(http.StatusConflict, codeBadRequest, "file has no watch mark")
 		}

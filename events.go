@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"log"
 	"net/http"
@@ -94,7 +95,7 @@ func (h *eventHub) publish(topic string, frame sseFrame) {
 func (h *eventHub) publishState(topic string, data []byte) {
 	h.mu.Lock()
 	previous, seen := h.last[topic]
-	changed := !seen || !bytesEqual(previous, data)
+	changed := !seen || !bytes.Equal(previous, data)
 	if changed {
 		h.last[topic] = data
 	}
@@ -109,18 +110,6 @@ func (h *eventHub) snapshotFor(topic string) ([]byte, bool) {
 	defer h.mu.Unlock()
 	data, ok := h.last[topic]
 	return data, ok
-}
-
-func bytesEqual(a, b []byte) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	for i := range a {
-		if a[i] != b[i] {
-			return false
-		}
-	}
-	return true
 }
 
 func (s *server) runStatePump(done <-chan struct{}) {

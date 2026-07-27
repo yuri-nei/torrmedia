@@ -360,3 +360,42 @@ func TestIDRoundTrip(t *testing.T) {
 		t.Fatal("file id escaping the item was accepted")
 	}
 }
+
+func TestRenderDoesNotMutateCatalog(t *testing.T) {
+	env := newTestEnv(t)
+	cat, item := env.firstItem(t)
+	before := make([]string, len(item.files))
+	for i, f := range item.files {
+		before[i] = f.status
+	}
+
+	done := make(chan struct{})
+	for i := 0; i < 4; i++ {
+		go func() {
+			for j := 0; j < 50; j++ {
+				env.renderDetail(cat, item)
+				env.renderList(cat)
+			}
+			done <- struct{}{}
+		}()
+	}
+	for i := 0; i < 4; i++ {
+		<-done
+	}
+	for i, f := range item.files {
+		if f.status != before[i] {
+			t.Fatalf("render changed catalog: file %q %q -> %q", f.name, before[i], f.status)
+		}
+	}
+}
+
+func TestPollUntilRefusesExpiredDeadline(t *testing.T) {
+	start := time.Now()
+	err := pollUntil(0, time.Millisecond, func() (bool, error) { return false, nil })
+	if err == nil {
+		t.Fatal("expired deadline was accepted")
+	}
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Fatalf("waited %s on an expired deadline", elapsed)
+	}
+}
