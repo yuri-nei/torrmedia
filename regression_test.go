@@ -203,6 +203,100 @@ func TestItemViewedClearFollowsActions(t *testing.T) {
 	}
 }
 
+func TestDeleteWatchedKeepsUnwatched(t *testing.T) {
+	env := newTestEnv(t)
+	cat, item := env.firstItem(t)
+	base := "/items/" + item.id + "/files"
+
+	if contains(env.itemActionList(cat, item), actionDeleteWatched) {
+		t.Fatal("delete_watched offered for an item without watch marks")
+	}
+	if rec := env.do(t, http.MethodDelete, base, ""); rec.Code != http.StatusBadRequest {
+		t.Fatalf("bare collection delete status=%d, want 400", rec.Code)
+	}
+	if rec := env.do(t, http.MethodDelete, base+"?watched=true", ""); rec.Code != http.StatusConflict {
+		t.Fatalf("status=%d body=%s, want 409", rec.Code, rec.Body)
+	}
+
+	mark := func(file, state string) {
+		t.Helper()
+		rec := env.do(t, http.MethodPut, base+"/"+file+"/viewed", `{"state":"`+state+`"}`)
+		if rec.Code != http.StatusNoContent {
+			t.Fatalf("mark %s: status=%d body=%s", state, rec.Code, rec.Body)
+		}
+	}
+	mark(item.files[0].id, watchWatched)
+	mark(item.files[1].id, watchStarted)
+
+	cat, item = env.firstItem(t)
+	if !contains(env.itemActionList(cat, item), actionDeleteWatched) {
+		t.Fatal("delete_watched is not offered for an item with a watched file")
+	}
+
+	kept := filepath.Join(env.root, "shows", "Release", "e02.mkv")
+	before, err := os.ReadFile(kept)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec := env.do(t, http.MethodDelete, base+"?watched=true", "")
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body)
+	}
+	op := env.awaitOperation(t, decodeJSON[operation](t, rec.Body.Bytes()).ID)
+	if op.State != opDone {
+		t.Fatalf("operation failed: %+v", op)
+	}
+
+	after, err := os.ReadFile(kept)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(before, after) {
+		t.Fatal("the unwatched file was modified")
+	}
+	calls := strings.Join(env.fake.snapshotCalls(), ",")
+	if !strings.Contains(calls, "prio0:0") {
+		t.Fatalf("the watched file was not excluded from the torrent: %q", calls)
+	}
+	if strings.Contains(calls, "prio0:1") {
+		t.Fatalf("the unwatched file was excluded too: %q", calls)
+	}
+}
+
+func TestDeleteWatchedRunsAsOneBatch(t *testing.T) {
+	env := newTestEnv(t)
+	env.deleteDebounce = 150 * time.Millisecond
+	_, item := env.firstItem(t)
+	base := "/items/" + item.id + "/files"
+
+	for _, file := range item.files {
+		rec := env.do(t, http.MethodPut, base+"/"+file.id+"/viewed", `{"state":"watched"}`)
+		if rec.Code != http.StatusNoContent {
+			t.Fatalf("mark %q: status=%d", file.name, rec.Code)
+		}
+	}
+	env.firstItem(t)
+
+	rec := env.do(t, http.MethodDelete, base+"?watched=true", "")
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body)
+	}
+	if op := env.awaitOperation(t, decodeJSON[operation](t, rec.Body.Bytes()).ID); op.State != opDone {
+		t.Fatalf("operation failed: %+v", op)
+	}
+
+	counts := map[string]int{}
+	for _, call := range env.fake.snapshotCalls() {
+		counts[call]++
+	}
+	if counts["prio0:0"] != 1 || counts["prio0:1"] != 1 {
+		t.Fatalf("both watched files must be excluded exactly once: %v", counts)
+	}
+	if counts["recheck"] != 1 {
+		t.Fatalf("recheck ran %d times, want one for the whole batch", counts["recheck"])
+	}
+}
+
 func TestOpenInRootRefusesSymlinkEscape(t *testing.T) {
 	root := testRoot(t)
 	outside := t.TempDir()

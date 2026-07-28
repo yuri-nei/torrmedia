@@ -144,6 +144,7 @@ func (s *server) buildCatalog() *catalog {
 		cat.qbitOK = false
 		cat.degraded = "qbittorrent is unavailable: " + err.Error()
 	}
+	torrents = withoutDrafts(torrents)
 	owners := newOwnershipIndex()
 	for i := range torrents {
 		t := &torrents[i]
@@ -200,11 +201,27 @@ func markAmbiguous(item *catalogItem) {
 	}
 }
 
-func (s *server) itemFromTorrent(t *qbTorrentSnapshot, owners *ownershipIndex) *catalogItem {
-	contentAbs := t.ContentPath
-	if contentAbs == "" {
-		contentAbs = filepath.Join(t.SavePath, t.Name)
+func torrentContentAbs(t *qbTorrent) string {
+	if t.ContentPath != "" {
+		return t.ContentPath
 	}
+	return filepath.Join(t.SavePath, t.Name)
+}
+
+func torrentFileWithin(contentAbs, savePath, name string, single bool) string {
+	within := filepath.ToSlash(name)
+	if single {
+		return filepath.Base(within)
+	}
+	abs := filepath.Join(savePath, filepath.FromSlash(name))
+	if rel, err := filepath.Rel(contentAbs, abs); err == nil && !strings.HasPrefix(rel, "..") {
+		return filepath.ToSlash(rel)
+	}
+	return within
+}
+
+func (s *server) itemFromTorrent(t *qbTorrentSnapshot, owners *ownershipIndex) *catalogItem {
+	contentAbs := torrentContentAbs(&t.qbTorrent)
 	shelfRel, inRoot := s.relToRoot(contentAbs)
 	item := &catalogItem{
 		title: t.Name, shelfRel: shelfRel, hash: t.Hash,
@@ -230,15 +247,7 @@ func (s *server) itemFromTorrent(t *qbTorrentSnapshot, owners *ownershipIndex) *
 			index = *f.Index
 		}
 		abs := filepath.Join(t.SavePath, filepath.FromSlash(f.Name))
-		within := filepath.ToSlash(f.Name)
-		if !singleFile {
-			if rel, err := filepath.Rel(contentAbs, abs); err == nil &&
-				!strings.HasPrefix(rel, "..") {
-				within = filepath.ToSlash(rel)
-			}
-		} else {
-			within = filepath.Base(within)
-		}
+		within := torrentFileWithin(contentAbs, t.SavePath, f.Name, singleFile)
 		fileShelfRel, fileInRoot := s.relToRoot(abs)
 		if !fileInRoot {
 			fileShelfRel = ""
@@ -311,6 +320,9 @@ func (s *server) shelfItems(claimed map[string]bool) []*catalogItem {
 			if entry.Type().IsRegular() {
 				add(abs, false)
 			}
+			continue
+		}
+		if rel, ok := s.relToRoot(abs); ok && claimed[rel] {
 			continue
 		}
 		sub, err := os.ReadDir(abs)

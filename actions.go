@@ -137,28 +137,12 @@ func (s *server) runFileDelete(op *operation, item *catalogItem, file *catalogFi
 		return map[string]any{"deleted": file.name}, []string{}, nil
 	}
 
-	abs, ok := s.fileAbs(file)
-	if !ok {
-		return nil, nil, errors.New("file lies outside the media root")
-	}
-	info, err := os.Stat(abs)
+	target, err := s.deleteTargetFor(item, file)
 	if err != nil {
-		if !errors.Is(err, os.ErrNotExist) {
-			return nil, nil, err
-		}
-		info = nil
+		return nil, nil, err
 	}
-	rel, err := filepath.Rel(s.root, abs)
-	if err != nil {
-		return nil, nil, errors.New("file lies outside the media root")
-	}
-
 	s.ops().phase(op.ID, "waiting")
-	hash, index := item.hash, file.qbitIndex
-	outcome := s.awaitDelete(&deleteTarget{
-		rel: rel, info: info,
-		match: qbMatch{hash: hash, fileID: index, abs: abs},
-	})
+	outcome := s.awaitDelete(target)
 	if outcome.err != "" {
 		return nil, nil, errors.New(outcome.err)
 	}
@@ -168,6 +152,92 @@ func (s *server) runFileDelete(op *operation, item *catalogItem, file *catalogFi
 	}
 	s.poke()
 	return outcome.response, warnings, nil
+}
+
+func (s *server) deleteTargetFor(item *catalogItem, file *catalogFile) (*deleteTarget, error) {
+	abs, ok := s.fileAbs(file)
+	if !ok {
+		return nil, errors.New("file lies outside the media root")
+	}
+	info, err := os.Stat(abs)
+	if err != nil {
+		if !errors.Is(err, os.ErrNotExist) {
+			return nil, err
+		}
+		info = nil
+	}
+	rel, err := filepath.Rel(s.root, abs)
+	if err != nil {
+		return nil, errors.New("file lies outside the media root")
+	}
+	return &deleteTarget{
+		rel: rel, info: info,
+		match: qbMatch{hash: item.hash, fileID: file.qbitIndex, abs: abs},
+	}, nil
+}
+
+func (s *server) runDeleteWatched(op *operation, item *catalogItem, files []catalogFile) (map[string]any, []string, error) {
+	warnings := []string{}
+	if len(files) == 0 {
+		return nil, warnings, errors.New("no watched files to delete")
+	}
+	seen := map[string]bool{}
+	warn := func(format string, args ...any) {
+		text := fmt.Sprintf(format, args...)
+		if !seen[text] {
+			seen[text] = true
+			warnings = append(warnings, text)
+		}
+	}
+
+	if !item.torrentBacked() {
+		s.ops().phase(op.ID, "deleting")
+		deleted := 0
+		for i := range files {
+			if err := s.removeShelfFile(&files[i]); err != nil {
+				warn("%s: %v", files[i].name, err)
+				continue
+			}
+			deleted++
+		}
+		if deleted == 0 {
+			return nil, warnings, errors.New("nothing was deleted")
+		}
+		s.poke()
+		return map[string]any{"deleted": deleted, "requested": len(files)}, warnings, nil
+	}
+
+	targets := make([]*deleteTarget, 0, len(files))
+	for i := range files {
+		target, err := s.deleteTargetFor(item, &files[i])
+		if err != nil {
+			warn("%s: %v", files[i].name, err)
+			continue
+		}
+		targets = append(targets, target)
+	}
+	if len(targets) == 0 {
+		return nil, warnings, errors.New("no watched file could be addressed")
+	}
+
+	s.ops().phase(op.ID, "waiting")
+	deleted := 0
+	for i, outcome := range s.awaitDeletes(targets) {
+		if outcome.err != "" {
+			warn("%s: %s", filepath.Base(targets[i].rel), outcome.err)
+			continue
+		}
+		deleted++
+		texts, _ := outcome.response["warnings"].([]string)
+		for _, text := range texts {
+			warn("%s", text)
+		}
+	}
+	if deleted == 0 {
+		return nil, warnings, errors.New("no watched file was deleted")
+	}
+	s.poke()
+	return map[string]any{"deleted": deleted, "requested": len(files)}, warnings, nil
 }
 
 func (s *server) reserveDeleteFile(file *catalogFile) (release func(), free bool, err error) {

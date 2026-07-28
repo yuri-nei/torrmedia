@@ -48,13 +48,15 @@ func newOperations(limit int) *operations {
 	}
 }
 
-func newOperationID() string {
-	buf := make([]byte, 6)
+func newRandomHex(n int) string {
+	buf := make([]byte, n)
 	if _, err := rand.Read(buf); err != nil {
-		panic("operation id: " + err.Error())
+		panic("random id: " + err.Error())
 	}
-	return "op_" + hex.EncodeToString(buf)
+	return hex.EncodeToString(buf)
 }
+
+func newOperationID() string { return "op_" + newRandomHex(6) }
 
 func (o *operations) start(kind, itemID string, fileID *string) *operation {
 	op := &operation{

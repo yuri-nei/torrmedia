@@ -40,7 +40,21 @@ type qbTorrent struct {
 	Completed int64   `json:"completed"`
 	NumLeechs int     `json:"num_leechs"`
 	AddedOn   int64   `json:"added_on"`
+
+	Tags string `json:"tags"`
 }
+
+func (t *qbTorrent) tagSet() map[string]bool {
+	out := map[string]bool{}
+	for _, raw := range strings.Split(t.Tags, ",") {
+		if tag := strings.TrimSpace(raw); tag != "" {
+			out[tag] = true
+		}
+	}
+	return out
+}
+
+func (t *qbTorrent) hasTag(tag string) bool { return t.tagSet()[tag] }
 
 type qbCategory struct {
 	Name     string `json:"name"`
@@ -170,6 +184,55 @@ func (q *qbit) files(hash string) ([]qbFile, error) {
 	var files []qbFile
 	err := q.getJSON("/api/v2/torrents/files?hash="+url.QueryEscape(hash), &files)
 	return files, err
+}
+
+func (q *qbit) filesIfKnown(hash string) ([]qbFile, bool, error) {
+	resp, err := q.doAuth("GET", "/api/v2/torrents/files?hash="+url.QueryEscape(hash), nil)
+	if err != nil {
+		return nil, false, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusNotFound || resp.StatusCode == http.StatusConflict {
+		io.Copy(io.Discard, resp.Body)
+		return nil, false, nil
+	}
+	if resp.StatusCode != http.StatusOK {
+		return nil, false, fmt.Errorf("GET torrents/files: HTTP %d", resp.StatusCode)
+	}
+	var files []qbFile
+	if err := json.NewDecoder(resp.Body).Decode(&files); err != nil {
+		return nil, false, err
+	}
+	if len(files) == 0 {
+		return nil, false, nil
+	}
+	return files, true, nil
+}
+
+func (q *qbit) torrentsWithTag(tag string) ([]qbTorrent, error) {
+	var torrents []qbTorrent
+	if err := q.getJSON("/api/v2/torrents/info", &torrents); err != nil {
+		return nil, err
+	}
+	out := []qbTorrent{}
+	for i := range torrents {
+		if torrents[i].hasTag(tag) {
+			out = append(out, torrents[i])
+		}
+	}
+	return out, nil
+}
+
+func (q *qbit) removeTags(hash string, tags []string) error {
+	return q.postOK("/api/v2/torrents/removeTags", url.Values{
+		"hashes": {hash}, "tags": {strings.Join(tags, ",")},
+	})
+}
+
+func (q *qbit) setCategory(hash, category string) error {
+	return q.postOK("/api/v2/torrents/setCategory", url.Values{
+		"hashes": {hash}, "category": {category},
+	})
 }
 
 func (q *qbit) properties(hash string) (*qbProperties, error) {
@@ -316,6 +379,41 @@ func (q *qbit) recheck(hash string) error {
 func (q *qbit) setFilePrio(hash string, id, prio int) error {
 	return q.postOK("/api/v2/torrents/filePrio", url.Values{
 		"hash": {hash}, "id": {strconv.Itoa(id)}, "priority": {strconv.Itoa(prio)},
+	})
+}
+
+func (q *qbit) setFilePrios(hash string, ids []int, prio int) error {
+	if len(ids) == 0 {
+		return nil
+	}
+	list := make([]string, 0, len(ids))
+	for _, id := range ids {
+		list = append(list, strconv.Itoa(id))
+	}
+	return q.postOK("/api/v2/torrents/filePrio", url.Values{
+		"hash": {hash}, "id": {strings.Join(list, "|")}, "priority": {strconv.Itoa(prio)},
+	})
+}
+
+func (q *qbit) waitFilePriorities(hash string, ids []int, priority int, timeout, interval time.Duration) error {
+	if len(ids) == 0 {
+		return nil
+	}
+	return pollUntil(timeout, interval, func() (bool, error) {
+		files, err := q.files(hash)
+		if err != nil {
+			return false, err
+		}
+		for _, id := range ids {
+			f, ok := qbFileByID(files, id)
+			if !ok {
+				return false, fmt.Errorf("file id %d disappeared", id)
+			}
+			if f.Priority != priority {
+				return false, nil
+			}
+		}
+		return true, nil
 	})
 }
 

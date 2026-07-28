@@ -23,6 +23,7 @@ const (
 	actionStart          = "start"
 	actionStop           = "stop"
 	actionRecheck        = "recheck"
+	actionDeleteWatched  = "delete_watched"
 	actionRemove         = "remove"
 	actionRemoveWithData = "remove_with_data"
 
@@ -74,6 +75,32 @@ type apiFile struct {
 	Watch    *string  `json:"watch"`
 	Position int64    `json:"position"`
 	Actions  []string `json:"actions"`
+}
+
+type apiStorage struct {
+	Free    *int64 `json:"free"`
+	Total   *int64 `json:"total"`
+	Reserve int64  `json:"reserve"`
+}
+
+type apiDraft struct {
+	ID       string         `json:"id"`
+	Status   string         `json:"status"`
+	Title    string         `json:"title"`
+	Size     int64          `json:"size"`
+	Category *string        `json:"category"`
+	Item     *string        `json:"item"`
+	Error    *string        `json:"error"`
+	Files    []apiDraftFile `json:"files"`
+	Storage  apiStorage     `json:"storage"`
+}
+
+type apiDraftFile struct {
+	ID     string `json:"id"`
+	Name   string `json:"name"`
+	Path   string `json:"path"`
+	Size   int64  `json:"size"`
+	Wanted bool   `json:"wanted"`
 }
 
 type apiItemList struct {

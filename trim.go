@@ -137,12 +137,22 @@ func trimSparseFile(f *os.File, expected os.FileInfo, pieceSize int64) (trimResu
 	return trimResult{logicalSize: size, retained: int64(len(prefix) + len(suffix)), freed: freed}, nil
 }
 
+func (s *server) awaitDeletes(targets []*deleteTarget) []*deleteBatchOutcome {
+	results := make([]chan *deleteBatchOutcome, len(targets))
+	for i, target := range targets {
+		results[i] = make(chan *deleteBatchOutcome, 1)
+		target.waiters = []chan *deleteBatchOutcome{results[i]}
+		s.enqueueTorrentDelete(target)
+	}
+	out := make([]*deleteBatchOutcome, len(targets))
+	for i, result := range results {
+		out[i] = (<-result).forTarget(targets[i].rel)
+	}
+	return out
+}
+
 func (s *server) awaitDelete(target *deleteTarget) *deleteBatchOutcome {
-	result := make(chan *deleteBatchOutcome, 1)
-	target.waiters = []chan *deleteBatchOutcome{result}
-	s.enqueueTorrentDelete(target)
-	outcome := <-result
-	return outcome.forTarget(target.rel)
+	return s.awaitDeletes([]*deleteTarget{target})[0]
 }
 
 func (s *server) pendingBatch(hash string) bool {

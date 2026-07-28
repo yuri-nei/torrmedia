@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
@@ -76,6 +77,33 @@ func TestEventsSendSnapshotOnConnect(t *testing.T) {
 	}
 	if len(list.Items) != 1 {
 		t.Fatalf("snapshot=%+v", list)
+	}
+}
+
+func TestEventsCloseAllReleasesStream(t *testing.T) {
+	env := newTestEnv(t)
+	env.refreshState()
+
+	srv := httptest.NewServer(env.routes())
+	defer srv.Close()
+	resp, err := http.Get(srv.URL + "/events")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	reader := bufio.NewReader(resp.Body)
+	readFrames(t, reader, 1, 3*time.Second)
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := io.ReadAll(reader)
+		done <- err
+	}()
+	env.hub().closeAll()
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("stream did not close after closeAll")
 	}
 }
 

@@ -72,6 +72,14 @@ func availableFilesystemBytes(path string) (int64, error) {
 	return int64(st.Bavail) * int64(st.Bsize), nil
 }
 
+func totalFilesystemBytes(path string) (int64, error) {
+	var st syscall.Statfs_t
+	if err := syscall.Statfs(path, &st); err != nil {
+		return 0, err
+	}
+	return int64(st.Blocks) * int64(st.Bsize), nil
+}
+
 func sortStrings(v []string) { sort.Strings(v) }
 
 func validStreamInfo(before, current os.FileInfo) bool {

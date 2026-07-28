@@ -182,6 +182,18 @@ func (h *eventHub) publishOperationFrame(topic string, data []byte) {
 	h.forEach(topic, func(sub *eventSub) { sub.pushOperation(data) })
 }
 
+func (h *eventHub) closeAll() {
+	h.mu.Lock()
+	subs := make([]*eventSub, 0, len(h.subs))
+	for sub := range h.subs {
+		subs = append(subs, sub)
+	}
+	h.mu.Unlock()
+	for _, sub := range subs {
+		sub.close()
+	}
+}
+
 func (h *eventHub) publishPing() {
 	h.mu.Lock()
 	subs := make([]*eventSub, 0, len(h.subs))
@@ -206,14 +218,19 @@ func (s *server) runStatePump(done <-chan struct{}) {
 	defer ticker.Stop()
 	ping := time.NewTicker(20 * time.Second)
 	defer ping.Stop()
+	sweep := time.NewTicker(time.Minute)
+	defer sweep.Stop()
 
 	s.refreshState()
+	s.sweepDrafts()
 	for {
 		select {
 		case <-done:
 			return
 		case <-ticker.C:
 			s.refreshState()
+		case <-sweep.C:
+			s.sweepDrafts()
 		case <-s.statePoke:
 			time.Sleep(150 * time.Millisecond)
 			drain(s.statePoke)
@@ -254,6 +271,9 @@ func (s *server) refreshState() {
 
 	for _, topic := range s.hub().topics() {
 		if topic == topicList {
+			continue
+		}
+		if isDraftTopic(topic) {
 			continue
 		}
 		item := cat.item(topic)

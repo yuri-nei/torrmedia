@@ -14,8 +14,8 @@ func deny(status int, code, reason string) *denial {
 
 var (
 	itemActionOrder = []string{
-		actionStart, actionStop, actionRecheck, actionRemove, actionRemoveWithData,
-		actionClearViewed,
+		actionStart, actionStop, actionRecheck, actionDeleteWatched,
+		actionRemove, actionRemoveWithData, actionClearViewed,
 	}
 	fileActionOrder = []string{
 		actionPlay, actionDelete, actionEnable, actionSetViewed, actionClearViewed,
@@ -44,7 +44,7 @@ func (s *server) permitItem(cat *catalog, item *catalogItem, action string) *den
 	if s.operations.busy(item.id) {
 		return deny(http.StatusConflict, codeBusy, "an operation is already running for this item")
 	}
-	needsTorrent := action != actionRemoveWithData
+	needsTorrent := action != actionRemoveWithData && action != actionDeleteWatched
 	if needsTorrent && !item.torrentBacked() {
 		return deny(http.StatusConflict, codeNotFound, "this item has no torrent behind it")
 	}
@@ -60,6 +60,10 @@ func (s *server) permitItem(cat *catalog, item *catalogItem, action string) *den
 	case actionRecheck:
 		if item.status == statusChecking {
 			return deny(http.StatusConflict, codeBusy, "item is already being checked")
+		}
+	case actionDeleteWatched:
+		if len(s.watchedToDelete(cat, item)) == 0 {
+			return deny(http.StatusConflict, codeNotFound, "item has no watched files to delete")
 		}
 	case actionRemove, actionRemoveWithData:
 	default:
@@ -122,6 +126,20 @@ func (s *server) permitFile(cat *catalog, item *catalogItem, file *catalogFile, 
 		return deny(http.StatusBadRequest, codeBadRequest, "unknown action")
 	}
 	return nil
+}
+
+func (s *server) watchedToDelete(cat *catalog, item *catalogItem) []*catalogFile {
+	var out []*catalogFile
+	for i := range item.files {
+		file := &item.files[i]
+		if file.watch != watchWatched {
+			continue
+		}
+		if s.permitFile(cat, item, file, actionDelete) == nil {
+			out = append(out, file)
+		}
+	}
+	return out
 }
 
 func (s *server) itemActionList(cat *catalog, item *catalogItem) []string {

@@ -15,7 +15,7 @@ import (
 	"time"
 )
 
-const version = "2026-07-28.4"
+const version = "2026-07-28.9"
 
 type server struct {
 	root   string
@@ -36,6 +36,12 @@ type server struct {
 	statePollInterval time.Duration
 	enableReserve     int64
 	availableBytes    func(string) (int64, error)
+	totalBytes        func(string) (int64, error)
+
+	draftsStore          *drafts
+	draftAddTimeout      time.Duration
+	draftMetadataTimeout time.Duration
+	draftTTL             time.Duration
 
 	viewed   *viewedStore
 	playback playbackConfig
@@ -70,6 +76,21 @@ func (s *server) ensureRuntime() {
 		}
 		if s.statePollInterval <= 0 {
 			s.statePollInterval = 2 * time.Second
+		}
+		if s.draftsStore == nil {
+			s.draftsStore = newDrafts()
+		}
+		if s.draftAddTimeout <= 0 {
+			s.draftAddTimeout = 30 * time.Second
+		}
+		if s.draftMetadataTimeout <= 0 {
+			s.draftMetadataTimeout = 3 * time.Minute
+		}
+		if s.draftTTL <= 0 {
+			s.draftTTL = 15 * time.Minute
+		}
+		if s.totalBytes == nil {
+			s.totalBytes = totalFilesystemBytes
 		}
 		if s.osRoot == nil && s.root != "" {
 			if r, err := os.OpenRoot(s.root); err == nil {
@@ -166,6 +187,7 @@ func main() {
 		statePollInterval: 2 * time.Second,
 		enableReserve:     512 << 20,
 		availableBytes:    availableFilesystemBytes,
+		totalBytes:        totalFilesystemBytes,
 		playback:          defaultPlaybackConfig(),
 	}
 	s.viewed, err = newViewedStore(envOr("TORRMEDIA_VIEWED_FILE", "/var/lib/torrmedia/viewed.json"))
@@ -175,6 +197,9 @@ func main() {
 	envDuration("TORRMEDIA_OPERATION_TIMEOUT", &s.operationTimeout)
 	envDuration("TORRMEDIA_DELETE_DEBOUNCE", &s.deleteDebounce)
 	envDuration("TORRMEDIA_STATE_POLL_INTERVAL", &s.statePollInterval)
+	s.ensureRuntime()
+	envDuration("TORRMEDIA_DRAFT_METADATA_TIMEOUT", &s.draftMetadataTimeout)
+	envDuration("TORRMEDIA_DRAFT_TTL", &s.draftTTL)
 
 	if qu := os.Getenv("QBIT_URL"); qu != "" {
 		if s.qb, err = newQbit(qu, os.Getenv("QBIT_USER"), os.Getenv("QBIT_PASS")); err != nil {
@@ -228,6 +253,7 @@ func main() {
 			log.Printf("torrmedia: in-flight operations did not finish in time")
 		}
 		close(pumpDone)
+		s.hub().closeAll()
 
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 		defer cancel()

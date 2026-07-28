@@ -32,6 +32,35 @@ func TestCatalogMergesTorrentAndDisk(t *testing.T) {
 	}
 }
 
+func TestItemInRootIsNotTreatedAsCategory(t *testing.T) {
+	root := testRoot(t)
+	const size = int64(1 << 20)
+	writeTestFile(t, filepath.Join(root, "Release", "e01.mkv"), size)
+	writeTestFile(t, filepath.Join(root, "Release", "e02.mkv"), size)
+
+	fake := newFakeQbit(&fakeTorrent{
+		hash: "0123456789012345678901234567890123456789", name: "Release",
+		savePath: root, state: "downloading",
+		files: []fakeFile{
+			{name: filepath.Join("Release", "e01.mkv"), size: size, priority: 1, progress: 1},
+			{name: filepath.Join("Release", "e02.mkv"), size: size, priority: 1, progress: 1},
+		},
+	})
+	env := newTestEnvWith(t, root, fake)
+
+	cat := env.buildCatalog()
+	if len(cat.items) != 1 {
+		names := []string{}
+		for _, item := range cat.items {
+			names = append(names, item.title)
+		}
+		t.Fatalf("items=%v, want one", names)
+	}
+	if len(cat.items[0].files) != 2 {
+		t.Fatalf("files=%d, want 2", len(cat.items[0].files))
+	}
+}
+
 func TestCatalogFileStatuses(t *testing.T) {
 	env := newTestEnv(t)
 	const size = int64(1 << 20)

@@ -29,6 +29,17 @@ type fakeTorrent struct {
 	magnet   string
 	state    string
 	files    []fakeFile
+	tags     []string
+	addedOn  int64
+}
+
+func (t *fakeTorrent) hasTag(tag string) bool {
+	for _, existing := range t.tags {
+		if existing == tag {
+			return true
+		}
+	}
+	return false
 }
 
 type fakeQbit struct {
@@ -38,6 +49,14 @@ type fakeQbit struct {
 	calls     []string
 	failInfo  bool
 	recheckIn time.Duration
+
+	addHash        string
+	addName        string
+	addSavePath    string
+	addFiles       []fakeFile
+	metadataIn     time.Duration
+	filesMissing   bool
+	ignoreStopCond bool
 }
 
 func newFakeQbit(t *fakeTorrent) *fakeQbit {
@@ -96,12 +115,16 @@ func (f *fakeQbit) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				size += file.size
 				completed += int64(float64(file.size) * file.progress)
 			}
+			addedOn := t.addedOn
+			if addedOn == 0 {
+				addedOn = 1700000000
+			}
 			out = append(out, qbTorrent{
 				Hash: t.hash, Name: t.name, SavePath: t.savePath,
 				ContentPath: filepath.Join(t.savePath, t.name), State: t.state,
 				Category: t.category, MagnetURI: t.magnet, Size: size,
-				Completed: completed, Progress: 1, AddedOn: 1700000000,
-				NumSeeds: 1, ETA: 8640000,
+				Completed: completed, Progress: 1, AddedOn: addedOn,
+				NumSeeds: 1, ETA: 8640000, Tags: strings.Join(t.tags, ", "),
 			})
 		}
 		json.NewEncoder(w).Encode(out)
@@ -109,6 +132,10 @@ func (f *fakeQbit) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case "/api/v2/torrents/files":
 		t := f.find(hash)
 		if t == nil {
+			http.NotFound(w, r)
+			return
+		}
+		if len(t.files) == 0 && f.filesMissing {
 			http.NotFound(w, r)
 			return
 		}
@@ -145,14 +172,45 @@ func (f *fakeQbit) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		f.calls = append(f.calls, "forceStart="+r.Form.Get("value"))
 	case "/api/v2/torrents/filePrio":
 		t := f.find(hash)
-		id, err := strconv.Atoi(r.Form.Get("id"))
-		priority, err2 := strconv.Atoi(r.Form.Get("priority"))
-		if t == nil || err != nil || err2 != nil || id < 0 || id >= len(t.files) {
+		priority, err := strconv.Atoi(r.Form.Get("priority"))
+		if t == nil || err != nil {
 			http.Error(w, "bad request", http.StatusBadRequest)
 			return
 		}
-		t.files[id].priority = priority
-		f.calls = append(f.calls, "prio"+strconv.Itoa(priority)+":"+strconv.Itoa(id))
+		for _, raw := range strings.Split(r.Form.Get("id"), "|") {
+			id, err := strconv.Atoi(raw)
+			if err != nil || id < 0 || id >= len(t.files) {
+				http.Error(w, "bad request", http.StatusBadRequest)
+				return
+			}
+			t.files[id].priority = priority
+			f.calls = append(f.calls, "prio"+strconv.Itoa(priority)+":"+strconv.Itoa(id))
+		}
+	case "/api/v2/torrents/removeTags":
+		t := f.find(hash)
+		if t == nil {
+			http.Error(w, "bad request", http.StatusBadRequest)
+			return
+		}
+		for _, raw := range strings.Split(r.Form.Get("tags"), ",") {
+			drop := strings.TrimSpace(raw)
+			kept := t.tags[:0]
+			for _, tag := range t.tags {
+				if tag != drop {
+					kept = append(kept, tag)
+				}
+			}
+			t.tags = kept
+		}
+		f.calls = append(f.calls, "removeTags:"+r.Form.Get("tags"))
+	case "/api/v2/torrents/setCategory":
+		t := f.find(hash)
+		if t == nil {
+			http.Error(w, "bad request", http.StatusBadRequest)
+			return
+		}
+		t.category = r.Form.Get("category")
+		f.calls = append(f.calls, "setCategory:"+t.category)
 	case "/api/v2/torrents/recheck":
 		f.calls = append(f.calls, "recheck")
 		t := f.find(hash)
@@ -177,6 +235,34 @@ func (f *fakeQbit) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		f.torrents = kept
 	case "/api/v2/torrents/add":
 		f.calls = append(f.calls, "add:category="+r.Form.Get("category"))
+		if f.addHash != "" {
+			f.calls = append(f.calls, "add:tags="+r.Form.Get("tags"),
+				"add:stopCondition="+r.Form.Get("stopCondition"))
+			added := &fakeTorrent{
+				hash: f.addHash, name: f.addName, savePath: f.addSavePath,
+				category: r.Form.Get("category"), magnet: r.Form.Get("urls"),
+				state: "metaDL", addedOn: time.Now().Unix(),
+			}
+			for _, raw := range strings.Split(r.Form.Get("tags"), ",") {
+				if tag := strings.TrimSpace(raw); tag != "" {
+					added.tags = append(added.tags, tag)
+				}
+			}
+			f.torrents = append(f.torrents, added)
+			files, delay := f.addFiles, f.metadataIn
+			stopOnMetadata := r.Form.Get("stopCondition") == "MetadataReceived" && !f.ignoreStopCond
+			go func() {
+				time.Sleep(delay)
+				f.mu.Lock()
+				added.files = files
+				if stopOnMetadata {
+					added.state = "stoppedDL"
+				} else {
+					added.state = "downloading"
+				}
+				f.mu.Unlock()
+			}()
+		}
 	default:
 		http.NotFound(w, r)
 		return
@@ -250,8 +336,12 @@ func newTestEnvWith(t *testing.T, root string, fake *fakeQbit) *testEnv {
 		root: root, qb: qb, viewed: store, playback: defaultPlaybackConfig(),
 		deleteDebounce: time.Millisecond, operationTimeout: 3 * time.Second,
 		pollInterval: 5 * time.Millisecond, statePollInterval: time.Hour,
-		enableReserve:  512 << 20,
-		availableBytes: func(string) (int64, error) { return 100 << 30, nil },
+		enableReserve:        512 << 20,
+		availableBytes:       func(string) (int64, error) { return 100 << 30, nil },
+		totalBytes:           func(string) (int64, error) { return 200 << 30, nil },
+		draftAddTimeout:      2 * time.Second,
+		draftMetadataTimeout: 2 * time.Second,
+		draftTTL:             time.Hour,
 	}
 	s.ensureRuntime()
 	s.operations.notify = s.publishOperation

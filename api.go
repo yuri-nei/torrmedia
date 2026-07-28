@@ -11,7 +11,14 @@ func (s *server) routes() http.Handler {
 
 	mux.HandleFunc("GET /health", s.handleHealth)
 	mux.HandleFunc("GET /categories", s.handleCategories)
+	mux.HandleFunc("GET /storage", s.handleStorage)
 	mux.HandleFunc("GET /operations/{op}", s.handleOperation)
+
+	mux.HandleFunc("POST /drafts", s.handleDraftCreate)
+	mux.HandleFunc("GET /drafts/{draft}", s.handleDraft)
+	mux.HandleFunc("GET /drafts/{draft}/events", s.handleDraftEvents)
+	mux.HandleFunc("POST /drafts/{draft}/confirm", s.handleDraftConfirm)
+	mux.HandleFunc("DELETE /drafts/{draft}", s.handleDraftDelete)
 
 	mux.HandleFunc("GET /events", func(w http.ResponseWriter, r *http.Request) {
 		s.serveEvents(w, r, topicList)
@@ -26,6 +33,7 @@ func (s *server) routes() http.Handler {
 	mux.HandleFunc("POST /items/{item}/recheck", s.itemCommand(actionRecheck))
 	mux.HandleFunc("DELETE /items/{item}/viewed", s.handleItemViewedClear)
 
+	mux.HandleFunc("DELETE /items/{item}/files", s.handleWatchedDelete)
 	mux.HandleFunc("DELETE /items/{item}/files/{file}", s.handleFileDelete)
 	mux.HandleFunc("POST /items/{item}/files/{file}/enable", s.handleFileEnable)
 	mux.HandleFunc("PUT /items/{item}/files/{file}/viewed", s.handleFileViewedSet)
@@ -267,6 +275,36 @@ func (s *server) handleFileDelete(w http.ResponseWriter, r *http.Request) {
 		func(op *operation) (map[string]any, []string, error) {
 			defer unreserve()
 			return s.runFileDelete(op, &itemCopy, &fileCopy)
+		})
+}
+
+func (s *server) handleWatchedDelete(w http.ResponseWriter, r *http.Request) {
+	cat, item, ok := s.resolveItem(w, r)
+	if !ok {
+		return
+	}
+	watched, err := parseBoolQuery(r, "watched")
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, codeBadRequest, "%v", err)
+		return
+	}
+	if !watched {
+		writeErr(w, http.StatusBadRequest, codeBadRequest,
+			"watched=true is required; deleting every file of an item is not offered")
+		return
+	}
+	if d := s.permitItem(cat, item, actionDeleteWatched); d != nil {
+		writeDenial(w, d)
+		return
+	}
+	itemCopy := *item
+	files := make([]catalogFile, 0, len(item.files))
+	for _, file := range s.watchedToDelete(cat, item) {
+		files = append(files, *file)
+	}
+	s.startOperation(w, "item."+actionDeleteWatched, item.id, nil,
+		func(op *operation) (map[string]any, []string, error) {
+			return s.runDeleteWatched(op, &itemCopy, files)
 		})
 }
 
