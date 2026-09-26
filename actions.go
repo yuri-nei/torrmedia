@@ -368,6 +368,45 @@ func (s *server) runFileEnable(op *operation, hash string, index int) (map[strin
 	}, warnings, nil
 }
 
+func (s *server) runFilePriority(op *operation, hash string, index, priority int) (map[string]any, []string, error) {
+	unlock, err := s.guardTorrent(hash)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer unlock()
+	warnings := []string{}
+
+	t, err := s.qb.torrent(hash)
+	if err != nil {
+		return nil, warnings, err
+	}
+	if qbitCheckingState(t.State) {
+		return nil, warnings, errors.New("torrent is being checked; priority was not applied")
+	}
+	files, err := s.qb.files(hash)
+	if err != nil {
+		return nil, warnings, err
+	}
+	file, ok := qbFileByID(files, index)
+	if !ok {
+		return nil, warnings, fmt.Errorf("file %d disappeared from the torrent", index)
+	}
+	if file.Priority == 0 {
+		return nil, warnings, errors.New("file is excluded; enable it first")
+	}
+	if file.Priority != priority {
+		s.ops().phase(op.ID, "prioritizing")
+		if err := s.qb.setFilePrio(hash, index, priority); err != nil {
+			return nil, warnings, err
+		}
+		if err := s.qb.waitFilePriority(hash, index, priority, s.operationTimeout, s.pollInterval); err != nil {
+			return nil, warnings, err
+		}
+	}
+	s.poke()
+	return map[string]any{"priority": priorityName(priority)}, warnings, nil
+}
+
 func (s *server) runAddMagnet(op *operation, magnet, category string) (map[string]any, []string, error) {
 	s.ops().phase(op.ID, "adding")
 	form := map[string]string{"urls": magnet}

@@ -36,6 +36,7 @@ func (s *server) routes() http.Handler {
 	mux.HandleFunc("DELETE /items/{item}/files", s.handleWatchedDelete)
 	mux.HandleFunc("DELETE /items/{item}/files/{file}", s.handleFileDelete)
 	mux.HandleFunc("POST /items/{item}/files/{file}/enable", s.handleFileEnable)
+	mux.HandleFunc("PUT /items/{item}/files/{file}/priority", s.handleFilePriority)
 	mux.HandleFunc("PUT /items/{item}/files/{file}/viewed", s.handleFileViewedSet)
 	mux.HandleFunc("DELETE /items/{item}/files/{file}/viewed", s.handleFileViewedClear)
 	mux.HandleFunc("GET /items/{item}/files/{file}/stream/{name...}", s.handleStream)
@@ -321,6 +322,34 @@ func (s *server) handleFileEnable(w http.ResponseWriter, r *http.Request) {
 	s.startOperation(w, "file.enable", item.id, &id,
 		func(op *operation) (map[string]any, []string, error) {
 			return s.runFileEnable(op, hash, index)
+		})
+}
+
+func (s *server) handleFilePriority(w http.ResponseWriter, r *http.Request) {
+	cat, item, file, ok := s.resolveFile(w, r)
+	if !ok {
+		return
+	}
+	var body struct {
+		Priority string `json:"priority"`
+	}
+	if err := decodeBody(r, &body); err != nil {
+		writeErr(w, http.StatusBadRequest, codeBadRequest, "%v", err)
+		return
+	}
+	priority, known := priorityValue(body.Priority)
+	if !known {
+		writeErr(w, http.StatusBadRequest, codeBadRequest, "unknown priority %q", body.Priority)
+		return
+	}
+	if d := s.permitFile(cat, item, file, actionSetPriority); d != nil {
+		writeDenial(w, d)
+		return
+	}
+	hash, index, id := item.hash, file.qbitIndex, file.id
+	s.startOperation(w, "file.priority", item.id, &id,
+		func(op *operation) (map[string]any, []string, error) {
+			return s.runFilePriority(op, hash, index, priority)
 		})
 }
 

@@ -22,6 +22,7 @@ type catalogFile struct {
 	size     int64
 	progress float64
 	status   string
+	priority string
 
 	watch    string
 	position int64
@@ -264,7 +265,8 @@ func (s *server) itemFromTorrent(t *qbTorrentSnapshot, owners *ownershipIndex) *
 		item.files = append(item.files, catalogFile{
 			id: fileID(within), name: filepath.Base(within), rel: within,
 			shelfRel: fileShelfRel, size: f.Size, progress: f.Progress,
-			status: status, qbitIndex: index, ambiguous: contested,
+			status: status, priority: priorityName(f.Priority),
+			qbitIndex: index, ambiguous: contested,
 		})
 	}
 	sort.Slice(item.files, func(i, j int) bool { return item.files[i].rel < item.files[j].rel })

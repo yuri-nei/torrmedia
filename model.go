@@ -30,9 +30,41 @@ const (
 	actionPlay        = "play"
 	actionDelete      = "delete"
 	actionEnable      = "enable"
+	actionSetPriority = "set_priority"
 	actionSetViewed   = "set_viewed"
 	actionClearViewed = "clear_viewed"
 )
+
+const (
+	priorityNormal = "normal"
+	priorityHigh   = "high"
+	priorityMax    = "max"
+)
+
+func priorityName(p int) string {
+	switch {
+	case p <= 0:
+		return ""
+	case p >= 7:
+		return priorityMax
+	case p == 6:
+		return priorityHigh
+	default:
+		return priorityNormal
+	}
+}
+
+func priorityValue(name string) (int, bool) {
+	switch name {
+	case priorityNormal:
+		return 1, true
+	case priorityHigh:
+		return 6, true
+	case priorityMax:
+		return 7, true
+	}
+	return 0, false
+}
 
 type apiTransfer struct {
 	Down  int64   `json:"down"`
@@ -72,6 +104,7 @@ type apiFile struct {
 	Size     int64    `json:"size"`
 	Progress float64  `json:"progress"`
 	Status   string   `json:"status"`
+	Priority *string  `json:"priority"`
 	Watch    *string  `json:"watch"`
 	Position int64    `json:"position"`
 	Actions  []string `json:"actions"`

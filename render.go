@@ -52,7 +52,7 @@ func (s *server) renderDetail(cat *catalog, item *catalogItem) apiItemDetail {
 		}
 		files = append(files, apiFile{
 			ID: f.id, Name: f.name, Path: f.rel, Size: f.size,
-			Progress: f.progress, Status: status,
+			Progress: f.progress, Status: status, Priority: nilIfEmpty(f.priority),
 			Watch: nilIfEmpty(f.watch), Position: f.position,
 			Actions: s.fileActionList(cat, item, f),
 		})

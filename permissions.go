@@ -18,7 +18,7 @@ var (
 		actionRemove, actionRemoveWithData, actionClearViewed,
 	}
 	fileActionOrder = []string{
-		actionPlay, actionDelete, actionEnable, actionSetViewed, actionClearViewed,
+		actionPlay, actionDelete, actionEnable, actionSetPriority, actionSetViewed, actionClearViewed,
 	}
 )
 
@@ -121,6 +121,19 @@ func (s *server) permitFile(cat *catalog, item *catalogItem, file *catalogFile, 
 		}
 		if file.status != fileSkipped {
 			return deny(http.StatusConflict, codeBadRequest, "file is not excluded")
+		}
+	case actionSetPriority:
+		if !item.torrentBacked() || file.qbitIndex < 0 {
+			return deny(http.StatusConflict, codeNotFound, "this file has no torrent behind it")
+		}
+		if file.status == fileSkipped || file.priority == "" {
+			return deny(http.StatusConflict, codeBadRequest, "file is excluded; enable it first")
+		}
+		if file.status == fileReady {
+			return deny(http.StatusConflict, codeBadRequest, "file is already downloaded")
+		}
+		if item.status == statusChecking {
+			return deny(http.StatusConflict, codeBusy, "item is being checked")
 		}
 	default:
 		return deny(http.StatusBadRequest, codeBadRequest, "unknown action")

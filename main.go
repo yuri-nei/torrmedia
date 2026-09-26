@@ -15,7 +15,7 @@ import (
 	"time"
 )
 
-const version = "2026-09-26.1"
+const version = "2026-09-26.2"
 
 type server struct {
 	root   string

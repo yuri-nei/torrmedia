@@ -607,3 +607,79 @@ func TestSeveralDeletesOfOneItemBatchTogether(t *testing.T) {
 		}
 	}
 }
+
+func TestFilePriorityOnlyForUnfinishedFiles(t *testing.T) {
+	env := newTestEnv(t)
+	abs := filepath.Join(env.root, "shows", "Release", "e01.mkv")
+	if err := os.Truncate(abs, 0); err != nil {
+		t.Fatal(err)
+	}
+	env.fake.mu.Lock()
+	env.fake.torrents[0].files[0].progress = 0
+	env.fake.torrents[0].files[1].priority = 0
+	env.fake.mu.Unlock()
+
+	_, item := env.firstItem(t)
+	detail := decodeJSON[apiItemDetail](t, env.do(t, http.MethodGet, "/items/"+item.id, "").Body.Bytes())
+	byName := map[string]apiFile{}
+	for _, f := range detail.Files {
+		byName[f.Name] = f
+	}
+	e01, e02 := byName["e01.mkv"], byName["e02.mkv"]
+	if e01.Priority == nil || *e01.Priority != priorityNormal || !contains(e01.Actions, actionSetPriority) {
+		t.Fatalf("e01=%+v", e01)
+	}
+	if e02.Priority != nil || contains(e02.Actions, actionSetPriority) {
+		t.Fatalf("skipped file must have neither priority nor set_priority: %+v", e02)
+	}
+
+	rec := env.do(t, http.MethodPut, "/items/"+item.id+"/files/"+e02.ID+"/priority", `{"priority":"high"}`)
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("skipped: status=%d body=%s", rec.Code, rec.Body)
+	}
+	rec = env.do(t, http.MethodPut, "/items/"+item.id+"/files/"+e01.ID+"/priority", `{"priority":"urgent"}`)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("unknown priority: status=%d body=%s", rec.Code, rec.Body)
+	}
+	rec = env.do(t, http.MethodPut, "/items/"+item.id+"/files/"+e01.ID+"/priority", `{"priority":"max"}`)
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body)
+	}
+	op := decodeJSON[operation](t, rec.Body.Bytes())
+	if op.Kind != "file.priority" {
+		t.Fatalf("operation=%+v", op)
+	}
+	if done := env.awaitOperation(t, op.ID); done.State != opDone {
+		t.Fatalf("operation failed: %+v", done)
+	}
+	env.fake.mu.Lock()
+	got := env.fake.torrents[0].files[0].priority
+	env.fake.mu.Unlock()
+	if got != 7 {
+		t.Fatalf("qbit priority=%d, want 7", got)
+	}
+	_, item = env.firstItem(t)
+	detail = decodeJSON[apiItemDetail](t, env.do(t, http.MethodGet, "/items/"+item.id, "").Body.Bytes())
+	for _, f := range detail.Files {
+		if f.Name == "e01.mkv" && (f.Priority == nil || *f.Priority != priorityMax) {
+			t.Fatalf("e01 after set=%+v", f)
+		}
+		if f.Name == "e02.mkv" && f.Status == fileReady && contains(f.Actions, actionSetPriority) {
+			t.Fatalf("ready file must not offer set_priority: %+v", f)
+		}
+	}
+}
+
+func TestPriorityNames(t *testing.T) {
+	for raw, want := range map[int]string{0: "", 1: priorityNormal, 4: priorityNormal, 6: priorityHigh, 7: priorityMax} {
+		if got := priorityName(raw); got != want {
+			t.Fatalf("priorityName(%d)=%q, want %q", raw, got, want)
+		}
+	}
+	for _, name := range []string{priorityNormal, priorityHigh, priorityMax} {
+		v, ok := priorityValue(name)
+		if !ok || priorityName(v) != name {
+			t.Fatalf("round trip %q -> %d", name, v)
+		}
+	}
+}
