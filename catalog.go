@@ -209,6 +209,20 @@ func torrentContentAbs(t *qbTorrent) string {
 	return filepath.Join(t.SavePath, t.Name)
 }
 
+func torrentTitle(t *qbTorrent, single bool) string {
+	if t.ContentPath == "" {
+		return t.Name
+	}
+	name := filepath.Base(filepath.Clean(t.ContentPath))
+	if single {
+		name = strings.TrimSuffix(name, filepath.Ext(name))
+	}
+	if name == "" || name == "." || name == string(filepath.Separator) {
+		return t.Name
+	}
+	return name
+}
+
 func torrentFileWithin(contentAbs, savePath, name string, single bool) string {
 	within := filepath.ToSlash(name)
 	if single {
@@ -225,7 +239,7 @@ func (s *server) itemFromTorrent(t *qbTorrentSnapshot, owners *ownershipIndex) *
 	contentAbs := torrentContentAbs(&t.qbTorrent)
 	shelfRel, inRoot := s.relToRoot(contentAbs)
 	item := &catalogItem{
-		title: t.Name, shelfRel: shelfRel, hash: t.Hash,
+		title: torrentTitle(&t.qbTorrent, len(t.files) == 1), shelfRel: shelfRel, hash: t.Hash,
 		category: t.Category, magnet: t.MagnetURI,
 		status: normalizeState(t.State), addedAt: t.AddedOn,
 		size: t.Size, downloaded: t.Completed, progress: t.Progress,

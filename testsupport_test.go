@@ -24,6 +24,7 @@ type fakeFile struct {
 type fakeTorrent struct {
 	hash     string
 	name     string
+	dn       string
 	savePath string
 	category string
 	magnet   string
@@ -119,8 +120,12 @@ func (f *fakeQbit) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			if addedOn == 0 {
 				addedOn = 1700000000
 			}
+			shown := t.name
+			if t.dn != "" {
+				shown = t.dn
+			}
 			out = append(out, qbTorrent{
-				Hash: t.hash, Name: t.name, SavePath: t.savePath,
+				Hash: t.hash, Name: shown, SavePath: t.savePath,
 				ContentPath: filepath.Join(t.savePath, t.name), State: t.state,
 				Category: t.category, MagnetURI: t.magnet, Size: size,
 				Completed: completed, Progress: 1, AddedOn: addedOn,

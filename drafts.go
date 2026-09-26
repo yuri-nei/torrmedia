@@ -226,7 +226,7 @@ func (s *server) resolveDraft(id, magnet string) {
 	}
 	s.setDraft(id, func(d *draft) {
 		d.status = draftReady
-		d.title = fresh.Name
+		d.title = torrentTitle(fresh, len(files) == 1)
 		d.files = draftFilesOf(fresh, files)
 		d.size = 0
 		for _, f := range d.files {

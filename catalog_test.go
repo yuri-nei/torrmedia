@@ -251,3 +251,31 @@ func contains(list []string, want string) bool {
 	}
 	return false
 }
+
+func TestTitleComesFromContentNotMagnetName(t *testing.T) {
+	env := newTestEnv(t)
+	env.fake.mu.Lock()
+	env.fake.torrents[0].dn = "rutor.info"
+	env.fake.mu.Unlock()
+	_, item := env.firstItem(t)
+	if item.title != "Release" {
+		t.Fatalf("title=%q, want the content folder name", item.title)
+	}
+}
+
+func TestTorrentTitle(t *testing.T) {
+	cases := []struct {
+		t      qbTorrent
+		single bool
+		want   string
+	}{
+		{qbTorrent{Name: "rutor.info", ContentPath: "/m/shows/House.S03.2160p"}, false, "House.S03.2160p"},
+		{qbTorrent{Name: "rutor.info", ContentPath: "/m/movies/Film.2024.1080p.mkv"}, true, "Film.2024.1080p"},
+		{qbTorrent{Name: "Fallback"}, false, "Fallback"},
+	}
+	for _, c := range cases {
+		if got := torrentTitle(&c.t, c.single); got != c.want {
+			t.Fatalf("torrentTitle(%+v)=%q, want %q", c.t, got, c.want)
+		}
+	}
+}
