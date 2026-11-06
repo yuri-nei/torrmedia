@@ -26,6 +26,8 @@ type operation struct {
 	Error      *string        `json:"error"`
 	Warnings   []string       `json:"warnings"`
 	Result     map[string]any `json:"result"`
+
+	doomed []string
 }
 
 type operations struct {
@@ -34,6 +36,8 @@ type operations struct {
 	order  []string
 	limit  int
 	active map[string]int
+
+	doomed map[string]map[string]int
 
 	notify func(operation)
 }
@@ -44,6 +48,7 @@ func newOperations(limit int) *operations {
 	}
 	return &operations{
 		byID: map[string]*operation{}, active: map[string]int{}, limit: limit,
+		doomed: map[string]map[string]int{},
 		notify: func(operation) {},
 	}
 }
@@ -58,15 +63,26 @@ func newRandomHex(n int) string {
 
 func newOperationID() string { return "op_" + newRandomHex(6) }
 
-func (o *operations) start(kind, itemID string, fileID *string) *operation {
+func (o *operations) start(kind, itemID string, fileID *string, doomed ...string) *operation {
 	op := &operation{
 		ID: newOperationID(), Kind: kind, Item: itemID, File: fileID,
 		State: opQueued, StartedAt: time.Now().Unix(), Warnings: []string{},
+		doomed: append([]string(nil), doomed...),
 	}
 	o.mu.Lock()
 	o.byID[op.ID] = op
 	o.order = append(o.order, op.ID)
 	o.active[itemID]++
+	if len(op.doomed) > 0 {
+		files := o.doomed[itemID]
+		if files == nil {
+			files = map[string]int{}
+			o.doomed[itemID] = files
+		}
+		for _, id := range op.doomed {
+			files[id]++
+		}
+	}
 	o.evictLocked()
 	snapshot := *op
 	o.mu.Unlock()
@@ -111,6 +127,16 @@ func (o *operations) update(id string, mutate func(*operation)) {
 		}
 		if o.active[op.Item] == 0 {
 			delete(o.active, op.Item)
+		}
+		if files := o.doomed[op.Item]; files != nil {
+			for _, id := range op.doomed {
+				if files[id]--; files[id] <= 0 {
+					delete(files, id)
+				}
+			}
+			if len(files) == 0 {
+				delete(o.doomed, op.Item)
+			}
 		}
 	}
 	snapshot := *op
@@ -162,6 +188,12 @@ func (o *operations) busy(itemID string) bool {
 	o.mu.Lock()
 	defer o.mu.Unlock()
 	return o.active[itemID] > 0
+}
+
+func (o *operations) dooms(itemID, fileID string) bool {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	return o.doomed[itemID][fileID] > 0
 }
 
 func ptr[T any](v T) *T { return &v }

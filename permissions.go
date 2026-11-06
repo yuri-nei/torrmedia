@@ -78,8 +78,8 @@ func (s *server) permitFile(cat *catalog, item *catalogItem, file *catalogFile, 
 		if file.status != fileReady {
 			return deny(http.StatusConflict, codeNotFound, "file is not fully downloaded")
 		}
-		if s.operations.busy(item.id) {
-			return deny(http.StatusConflict, codeBusy, "an operation is running for this item")
+		if s.operations.dooms(item.id, file.id) {
+			return deny(http.StatusConflict, codeBusy, "file is being deleted")
 		}
 		return nil
 	case actionSetViewed:

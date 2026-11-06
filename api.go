@@ -185,7 +185,7 @@ func (s *server) itemCommand(action string) http.HandlerFunc {
 			return
 		}
 		hash, kind := item.hash, "item."+action
-		s.startOperation(w, kind, item.id, nil, func(op *operation) (map[string]any, []string, error) {
+		s.startOperation(w, kind, item.id, nil, nil, func(op *operation) (map[string]any, []string, error) {
 			return s.runItemCommand(op, hash, action)
 		})
 	}
@@ -220,7 +220,13 @@ func (s *server) handleItemDelete(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	snapshot := *item
-	s.startOperation(w, "item."+action, item.id, nil, func(op *operation) (map[string]any, []string, error) {
+	var doomed []string
+	if deleteFiles {
+		for i := range item.files {
+			doomed = append(doomed, item.files[i].id)
+		}
+	}
+	s.startOperation(w, "item."+action, item.id, nil, doomed, func(op *operation) (map[string]any, []string, error) {
 		return s.runItemRemove(op, &snapshot, deleteFiles)
 	})
 }
@@ -247,7 +253,7 @@ func (s *server) handleItemCreate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	magnet, category := body.Magnet, body.Category
-	s.startOperation(w, "item.add", "", nil, func(op *operation) (map[string]any, []string, error) {
+	s.startOperation(w, "item.add", "", nil, nil, func(op *operation) (map[string]any, []string, error) {
 		return s.runAddMagnet(op, magnet, category)
 	})
 }
@@ -272,7 +278,7 @@ func (s *server) handleFileDelete(w http.ResponseWriter, r *http.Request) {
 			"file is being streamed right now; nothing deleted")
 		return
 	}
-	s.startOperation(w, "file.delete", item.id, &fileCopy.id,
+	s.startOperation(w, "file.delete", item.id, &fileCopy.id, []string{fileCopy.id},
 		func(op *operation) (map[string]any, []string, error) {
 			defer unreserve()
 			return s.runFileDelete(op, &itemCopy, &fileCopy)
@@ -300,10 +306,12 @@ func (s *server) handleWatchedDelete(w http.ResponseWriter, r *http.Request) {
 	}
 	itemCopy := *item
 	files := make([]catalogFile, 0, len(item.files))
+	doomed := make([]string, 0, len(item.files))
 	for _, file := range s.watchedToDelete(cat, item) {
 		files = append(files, *file)
+		doomed = append(doomed, file.id)
 	}
-	s.startOperation(w, "item."+actionDeleteWatched, item.id, nil,
+	s.startOperation(w, "item."+actionDeleteWatched, item.id, nil, doomed,
 		func(op *operation) (map[string]any, []string, error) {
 			return s.runDeleteWatched(op, &itemCopy, files)
 		})
@@ -319,7 +327,7 @@ func (s *server) handleFileEnable(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	hash, index, id := item.hash, file.qbitIndex, file.id
-	s.startOperation(w, "file.enable", item.id, &id,
+	s.startOperation(w, "file.enable", item.id, &id, nil,
 		func(op *operation) (map[string]any, []string, error) {
 			return s.runFileEnable(op, hash, index)
 		})
@@ -347,7 +355,7 @@ func (s *server) handleFilePriority(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	hash, index, id := item.hash, file.qbitIndex, file.id
-	s.startOperation(w, "file.priority", item.id, &id,
+	s.startOperation(w, "file.priority", item.id, &id, nil,
 		func(op *operation) (map[string]any, []string, error) {
 			return s.runFilePriority(op, hash, index, priority)
 		})

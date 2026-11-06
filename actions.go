@@ -12,9 +12,9 @@ import (
 )
 
 func (s *server) startOperation(w http.ResponseWriter, kind, itemID string, fileID *string,
-	body func(*operation) (map[string]any, []string, error)) {
+	doomed []string, body func(*operation) (map[string]any, []string, error)) {
 
-	op := s.ops().start(kind, itemID, fileID)
+	op := s.ops().start(kind, itemID, fileID, doomed...)
 	snapshot, _ := s.ops().get(op.ID)
 
 	s.inflight.Add(1)

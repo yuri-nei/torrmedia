@@ -550,20 +550,71 @@ func TestDeleteReservesFileBeforeOperationStarts(t *testing.T) {
 	}
 }
 
-func TestBusyItemDoesNotOfferPlay(t *testing.T) {
+func TestOperationHidesPlayOnlyForDoomedFiles(t *testing.T) {
 	env := newTestEnv(t)
 	_, item := env.firstItem(t)
+	doomed := item.files[0].id
 
-	op := env.ops().start("test.block", item.id, nil)
+	op := env.ops().start("test.block", item.id, nil, doomed)
 	cat := env.buildCatalog()
 	env.catalog.Store(cat)
 	busy := cat.item(item.id)
 	for i := range busy.files {
-		if contains(env.fileActionList(cat, busy, &busy.files[i]), actionPlay) {
-			t.Fatalf("busy item still offers play for %q", busy.files[i].name)
+		f := &busy.files[i]
+		offered := contains(env.fileActionList(cat, busy, f), actionPlay)
+		if f.id == doomed && offered {
+			t.Fatalf("file being deleted still offers play: %q", f.name)
+		}
+		if f.id != doomed && !offered {
+			t.Fatalf("untouched ready file lost play during an operation: %q", f.name)
 		}
 	}
+
 	env.ops().succeed(op.ID, nil, nil)
+	if !contains(env.fileActionList(cat, busy, &busy.files[0]), actionPlay) {
+		t.Fatal("play did not come back after the operation finished")
+	}
+}
+
+func TestNeighbourPlaysWhileFileIsBeingDeleted(t *testing.T) {
+	env := newTestEnv(t)
+	env.deleteDebounce = 300 * time.Millisecond
+	_, item := env.firstItem(t)
+	victim, neighbour := item.files[0], item.files[1]
+
+	rec := env.do(t, http.MethodDelete, "/items/"+item.id+"/files/"+victim.id, "")
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("delete: status=%d body=%s", rec.Code, rec.Body)
+	}
+	opID := decodeJSON[operation](t, rec.Body.Bytes()).ID
+
+	detail := decodeJSON[apiItemDetail](t, env.do(t, http.MethodGet, "/items/"+item.id, "").Body.Bytes())
+	for _, f := range detail.Files {
+		switch f.ID {
+		case victim.id:
+			if contains(f.Actions, actionPlay) {
+				t.Fatalf("file being deleted offers play: %+v", f)
+			}
+		case neighbour.id:
+			if !contains(f.Actions, actionPlay) {
+				t.Fatalf("neighbour lost play while another file is deleted: %+v", f)
+			}
+		}
+	}
+
+	stream := func(f catalogFile) int {
+		return env.do(t, http.MethodGet, "/items/"+item.id+"/files/"+f.id+"/stream/"+f.name, "").Code
+	}
+	if code := stream(neighbour); code != http.StatusOK {
+		t.Fatalf("neighbour stream during delete: status=%d", code)
+	}
+	if code := stream(victim); code != http.StatusConflict {
+		t.Fatalf("stream of the file being deleted: status=%d, want 409", code)
+	}
+
+	if op := env.awaitOperation(t, opID); op.State != opDone {
+		t.Fatalf("delete failed: %+v", op)
+	}
 }
 
 func TestSeveralDeletesOfOneItemBatchTogether(t *testing.T) {
