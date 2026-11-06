@@ -88,8 +88,14 @@ func TestDraftConfirmAppliesSelection(t *testing.T) {
 			t.Fatalf("file %q is not preselected", f.Name)
 		}
 	}
-	if ready.Files[2].Path != "extras/sample.mkv" {
-		t.Fatalf("path=%q", ready.Files[2].Path)
+	var paths []string
+	byPath := map[string]string{}
+	for _, f := range ready.Files {
+		paths = append(paths, f.Path)
+		byPath[f.Path] = f.ID
+	}
+	if got := strings.Join(paths, " "); got != "extras/sample.mkv s01e01.mkv s01e02.mkv" {
+		t.Fatalf("paths=%q", got)
 	}
 	if ready.Storage.Free == nil || *ready.Storage.Free != 100<<30 {
 		t.Fatalf("storage=%+v", ready.Storage)
@@ -105,7 +111,7 @@ func TestDraftConfirmAppliesSelection(t *testing.T) {
 		}
 	}
 
-	body := `{"files":["` + ready.Files[0].ID + `","` + ready.Files[1].ID + `"],"category":"Shows"}`
+	body := `{"files":["` + byPath["s01e01.mkv"] + `","` + byPath["s01e02.mkv"] + `"],"category":"Shows"}`
 	rec := env.do(t, "POST", "/drafts/"+created.ID+"/confirm", body)
 	if rec.Code != http.StatusAccepted {
 		t.Fatalf("confirm = %d %s", rec.Code, rec.Body.String())
@@ -432,5 +438,42 @@ func TestMagnetInfoHash(t *testing.T) {
 		if got := magnetInfoHash(magnet); got != want {
 			t.Errorf("magnetInfoHash(%q) = %q, want %q", magnet, got, want)
 		}
+	}
+}
+
+func TestDraftFilesFollowCatalogOrder(t *testing.T) {
+	env := draftEnv(t)
+	env.fake.addFiles = []fakeFile{
+		{name: filepath.Join("Series", "s01e03.mkv"), size: 1 << 20, priority: 1},
+		{name: filepath.Join("Series", "s01e01.mkv"), size: 1 << 20, priority: 1},
+		{name: filepath.Join("Series", "s01e02.mkv"), size: 1 << 20, priority: 1},
+	}
+	created := env.createDraft(t, `{"magnet":"`+draftMagnet+`"}`)
+	ready := env.awaitDraft(t, created.ID, draftReady)
+
+	var ids, paths []string
+	for _, f := range ready.Files {
+		ids = append(ids, f.ID)
+		paths = append(paths, f.Path)
+	}
+	if got := strings.Join(paths, " "); got != "s01e01.mkv s01e02.mkv s01e03.mkv" {
+		t.Fatalf("draft order=%q", got)
+	}
+
+	body := `{"files":["` + strings.Join(ids, `","`) + `"]}`
+	if rec := env.do(t, "POST", "/drafts/"+created.ID+"/confirm", body); rec.Code != http.StatusAccepted {
+		t.Fatalf("confirm = %d %s", rec.Code, rec.Body.String())
+	}
+	confirmed := env.awaitDraft(t, created.ID, draftConfirmed, draftFailed)
+	if confirmed.Status != draftConfirmed || confirmed.Item == nil {
+		t.Fatalf("confirm failed: %+v", confirmed)
+	}
+	detail := decodeJSON[apiItemDetail](t, env.do(t, "GET", "/items/"+*confirmed.Item, "").Body.Bytes())
+	var after []string
+	for _, f := range detail.Files {
+		after = append(after, f.ID)
+	}
+	if strings.Join(after, " ") != strings.Join(ids, " ") {
+		t.Fatalf("item order %v differs from draft order %v", after, ids)
 	}
 }

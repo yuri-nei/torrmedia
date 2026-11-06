@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/url"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -313,6 +314,7 @@ func draftFilesOf(t *qbTorrent, files []qbFile) []draftFile {
 			wanted: true,
 		})
 	}
+	sort.Slice(out, func(i, j int) bool { return fileOrderLess(out[i].rel, out[j].rel) })
 	return out
 }
 

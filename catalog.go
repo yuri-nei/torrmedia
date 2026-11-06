@@ -283,9 +283,11 @@ func (s *server) itemFromTorrent(t *qbTorrentSnapshot, owners *ownershipIndex) *
 			qbitIndex: index, ambiguous: contested,
 		})
 	}
-	sort.Slice(item.files, func(i, j int) bool { return item.files[i].rel < item.files[j].rel })
+	sort.Slice(item.files, func(i, j int) bool { return fileOrderLess(item.files[i].rel, item.files[j].rel) })
 	return item
 }
+
+func fileOrderLess(a, b string) bool { return a < b }
 
 func normalizeETA(eta int64) *int64 {
 	if eta <= 0 || eta >= 8640000 {
@@ -406,7 +408,7 @@ func (s *server) shelfFiles(dirAbs, dirRel string) []catalogFile {
 		log.Printf("shelf: walk %q: %v", dirAbs, err)
 		return nil
 	}
-	sort.Slice(files, func(i, j int) bool { return files[i].rel < files[j].rel })
+	sort.Slice(files, func(i, j int) bool { return fileOrderLess(files[i].rel, files[j].rel) })
 	return files
 }
 
