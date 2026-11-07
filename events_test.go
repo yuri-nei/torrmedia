@@ -80,6 +80,35 @@ func TestEventsSendSnapshotOnConnect(t *testing.T) {
 	}
 }
 
+func TestItemEventsSendSnapshotOnConnect(t *testing.T) {
+	env := newTestEnv(t)
+	_, item := env.firstItem(t)
+	env.refreshState()
+
+	srv := httptest.NewServer(env.routes())
+	defer srv.Close()
+	resp, err := http.Get(srv.URL + "/items/" + item.id + "/events")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status=%d", resp.StatusCode)
+	}
+
+	frames := readFrames(t, bufio.NewReader(resp.Body), 1, 3*time.Second)
+	if frames[0].event != eventState {
+		t.Fatalf("first frame is %q", frames[0].event)
+	}
+	var detail apiItemDetail
+	if err := json.Unmarshal(frames[0].data, &detail); err != nil {
+		t.Fatalf("snapshot is not an item: %s", frames[0].data)
+	}
+	if detail.ID != item.id || len(detail.Files) == 0 {
+		t.Fatalf("snapshot=%+v", detail)
+	}
+}
+
 func TestEventsCloseAllReleasesStream(t *testing.T) {
 	env := newTestEnv(t)
 	env.refreshState()

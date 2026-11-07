@@ -165,6 +165,18 @@ func (h *eventHub) forEach(topic string, fn func(*eventSub)) {
 	}
 }
 
+func (h *eventHub) seedState(topic string, data []byte) {
+	h.mu.Lock()
+	_, seen := h.last[topic]
+	if !seen {
+		h.last[topic] = data
+	}
+	h.mu.Unlock()
+	if !seen {
+		h.forEach(topic, func(sub *eventSub) { sub.pushState(data) })
+	}
+}
+
 func (h *eventHub) publishState(topic string, data []byte) {
 	h.mu.Lock()
 	previous, seen := h.last[topic]
@@ -311,6 +323,7 @@ func (s *server) serveEvents(w http.ResponseWriter, r *http.Request, topic strin
 		writeSSE(w, sseFrame{event: eventState, data: data})
 		flusher.Flush()
 	} else {
+		s.seedTopic(topic)
 		s.poke()
 	}
 
@@ -334,6 +347,26 @@ func (s *server) serveEvents(w http.ResponseWriter, r *http.Request, topic strin
 			}
 		}
 	}
+}
+
+func (s *server) seedTopic(topic string) {
+	if topic == topicList || isDraftTopic(topic) {
+		return
+	}
+	cat := s.catalog.Load()
+	if cat == nil {
+		return
+	}
+	item := cat.item(topic)
+	if item == nil {
+		return
+	}
+	detail, err := json.Marshal(s.renderDetail(cat, item))
+	if err != nil {
+		log.Printf("state: marshal item %s: %v", topic, err)
+		return
+	}
+	s.hub().seedState(topic, detail)
 }
 
 func writeSSE(w http.ResponseWriter, frame sseFrame) {
