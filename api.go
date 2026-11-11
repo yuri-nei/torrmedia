@@ -278,7 +278,7 @@ func (s *server) handleFileDelete(w http.ResponseWriter, r *http.Request) {
 			"file is being streamed right now; nothing deleted")
 		return
 	}
-	s.startOperation(w, "file.delete", item.id, &fileCopy.id, []string{fileCopy.id},
+	s.startOperation(w, opFileDelete, item.id, &fileCopy.id, []string{fileCopy.id},
 		func(op *operation) (map[string]any, []string, error) {
 			defer unreserve()
 			return s.runFileDelete(op, &itemCopy, &fileCopy)
@@ -311,7 +311,7 @@ func (s *server) handleWatchedDelete(w http.ResponseWriter, r *http.Request) {
 		files = append(files, *file)
 		doomed = append(doomed, file.id)
 	}
-	s.startOperation(w, "item."+actionDeleteWatched, item.id, nil, doomed,
+	s.startOperation(w, opItemDeleteWatched, item.id, nil, doomed,
 		func(op *operation) (map[string]any, []string, error) {
 			return s.runDeleteWatched(op, &itemCopy, files)
 		})
@@ -327,7 +327,7 @@ func (s *server) handleFileEnable(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	hash, index, id := item.hash, file.qbitIndex, file.id
-	s.startOperation(w, "file.enable", item.id, &id, nil,
+	s.startOperation(w, opFileEnable, item.id, &id, nil,
 		func(op *operation) (map[string]any, []string, error) {
 			return s.runFileEnable(op, hash, index)
 		})

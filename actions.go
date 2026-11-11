@@ -277,8 +277,39 @@ func (s *server) removeShelfFile(file *catalogFile) error {
 	return nil
 }
 
+func (s *server) lockAfterDeletes(op *operation, hash string) (func(), error) {
+	debounce := s.deleteDebounce
+	if debounce <= 0 {
+		debounce = 30 * time.Second
+	}
+	deadline := time.Now().Add(3*debounce + s.operationTimeout)
+	wait := s.pollInterval
+	if wait <= 0 {
+		wait = 250 * time.Millisecond
+	}
+	if s.pendingBatch(hash) || s.operations.busyBeyond(op.Item, opFileEnable) {
+		s.ops().phase(op.ID, "waiting")
+	}
+	for {
+		if s.draining.Load() {
+			return nil, errors.New("torrmedia is shutting down; file was not enabled")
+		}
+		if !s.pendingBatch(hash) {
+			unlock := s.lockTorrent(hash)
+			if !s.pendingBatch(hash) && !s.draining.Load() {
+				return unlock, nil
+			}
+			unlock()
+		}
+		if time.Now().After(deadline) {
+			return nil, errors.New("deletion on this item did not finish in time; file was not enabled")
+		}
+		time.Sleep(wait)
+	}
+}
+
 func (s *server) runFileEnable(op *operation, hash string, index int) (map[string]any, []string, error) {
-	unlock, err := s.guardTorrent(hash)
+	unlock, err := s.lockAfterDeletes(op, hash)
 	if err != nil {
 		return nil, nil, err
 	}

@@ -3,6 +3,7 @@ package main
 import (
 	"crypto/rand"
 	"encoding/hex"
+	"slices"
 	"sync"
 	"time"
 )
@@ -29,6 +30,12 @@ type operation struct {
 
 	doomed []string
 }
+
+const (
+	opFileDelete        = "file.delete"
+	opItemDeleteWatched = "item." + actionDeleteWatched
+	opFileEnable        = "file.enable"
+)
 
 type operations struct {
 	mu     sync.Mutex
@@ -188,6 +195,23 @@ func (o *operations) busy(itemID string) bool {
 	o.mu.Lock()
 	defer o.mu.Unlock()
 	return o.active[itemID] > 0
+}
+
+func (o *operations) busyBeyond(itemID string, allowed ...string) bool {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if o.active[itemID] == 0 {
+		return false
+	}
+	for _, op := range o.byID {
+		if op.Item != itemID || op.finished() {
+			continue
+		}
+		if !slices.Contains(allowed, op.Kind) {
+			return true
+		}
+	}
+	return false
 }
 
 func (o *operations) dooms(itemID, fileID string) bool {

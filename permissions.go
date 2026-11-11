@@ -72,6 +72,8 @@ func (s *server) permitItem(cat *catalog, item *catalogItem, action string) *den
 	return nil
 }
 
+var enableQueuesBehind = []string{opFileDelete, opItemDeleteWatched, opFileEnable}
+
 func (s *server) permitFile(cat *catalog, item *catalogItem, file *catalogFile, action string) *denial {
 	switch action {
 	case actionPlay:
@@ -100,7 +102,11 @@ func (s *server) permitFile(cat *catalog, item *catalogItem, file *catalogFile, 
 	if !cat.qbitOK {
 		return deny(http.StatusBadGateway, codeQbitUnavailable, "qbittorrent is unavailable")
 	}
-	if action != actionDelete && s.operations.busy(item.id) {
+	busy := s.operations.busy(item.id)
+	if action == actionEnable {
+		busy = s.operations.busyBeyond(item.id, enableQueuesBehind...)
+	}
+	if action != actionDelete && busy {
 		return deny(http.StatusConflict, codeBusy, "an operation is already running for this item")
 	}
 	if file.ambiguous {
