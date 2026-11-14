@@ -316,6 +316,15 @@ func qbitStoppedState(state string) bool {
 		strings.HasPrefix(strings.ToLower(state), "paused")
 }
 
+// qbitErrorState: qBittorrent ranks MissingFiles and Error above Stopped
+// when it computes the state, so a stopped torrent with a file error (a full
+// disk puts it into upload mode, which qBittorrent reports as an error) is
+// still listed as error or missingFiles.
+func qbitErrorState(state string) bool {
+	lower := strings.ToLower(state)
+	return strings.HasPrefix(lower, "error") || strings.HasPrefix(lower, "missingfiles")
+}
+
 func qbitCheckingState(state string) bool {
 	return strings.HasPrefix(strings.ToLower(state), "checking")
 }
@@ -363,13 +372,21 @@ func pollUntil(timeout, interval time.Duration, check func() (bool, error)) erro
 	}
 }
 
+// waitStopped waits for a stop to take effect. A torrent with a file error
+// never shows a stopped state (see qbitErrorState), so for it the stop counts
+// as applied once qBittorrent has had a refresh interval to process it;
+// libtorrent does not write to a torrent in that state anyway.
 func (q *qbit) waitStopped(hash string, timeout, interval time.Duration) error {
+	issued := time.Now()
 	return pollUntil(timeout, interval, func() (bool, error) {
 		t, err := q.torrent(hash)
 		if err != nil {
 			return false, err
 		}
-		return qbitStoppedState(t.State), nil
+		if qbitStoppedState(t.State) {
+			return true, nil
+		}
+		return qbitErrorState(t.State) && time.Since(issued) >= q.stateLag, nil
 	})
 }
 
@@ -495,7 +512,7 @@ func (q *qbit) waitRecheck(hash string, id int, stall, interval time.Duration) e
 	if err != nil {
 		return err
 	}
-	if !qbitStoppedState(t.State) {
+	if !qbitStoppedState(t.State) && !qbitErrorState(t.State) {
 		return fmt.Errorf("torrent unexpectedly left stopped state after recheck: %s", t.State)
 	}
 	files, err := q.files(hash)

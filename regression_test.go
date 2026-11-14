@@ -1205,3 +1205,40 @@ func TestUnsafePieceSizeChangesNothing(t *testing.T) {
 		t.Fatalf("file status after the refused delete: %s", after.files[0].status)
 	}
 }
+
+// qBittorrent reports a torrent with a file error as error or missingFiles
+// even after it is stopped. That is exactly the full-disk case in which the
+// user deletes episodes to free space, and the batch used to wait for a
+// stopped state that never came, fail after the operation timeout and
+// restart the torrent with nothing deleted.
+func TestDeleteFromErroredTorrent(t *testing.T) {
+	for _, errorState := range []string{"error", "missingFiles"} {
+		t.Run(errorState, func(t *testing.T) {
+			env := newTestEnv(t)
+			env.deleteDebounce = 20 * time.Millisecond
+			env.operationTimeout = 2 * time.Second
+			env.qb.stateLag = 50 * time.Millisecond
+			env.fake.mu.Lock()
+			env.fake.torrents[0].state = "downloading"
+			env.fake.torrents[0].errorState = errorState
+			env.fake.mu.Unlock()
+			_, item := env.firstItem(t)
+			if !contains(env.fileActionList(env.catalog.Load(), item, &item.files[0]), actionDelete) {
+				t.Fatal("delete is not offered for an errored torrent")
+			}
+
+			rec := env.do(t, http.MethodDelete, "/items/"+item.id+"/files/"+item.files[0].id, "")
+			if rec.Code != http.StatusAccepted {
+				t.Fatalf("delete: status=%d body=%s", rec.Code, rec.Body)
+			}
+			op := env.awaitOperation(t, decodeJSON[operation](t, rec.Body.Bytes()).ID)
+			if op.State != opDone {
+				t.Fatalf("delete: %+v", op)
+			}
+			calls := env.fake.snapshotCalls()
+			if len(calls) == 0 || calls[len(calls)-1] != "start" {
+				t.Fatalf("the torrent was not restarted after the batch: %v", calls)
+			}
+		})
+	}
+}

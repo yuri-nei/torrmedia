@@ -45,6 +45,10 @@ type fakeTorrent struct {
 	stopAfterCheck bool
 	checkProgress  float64 // progress in the API while the check runs
 	checkActive    bool    // left the check queue (see fakeQbit.serialChecks)
+	// errorState, when set ("error" or "missingFiles"), is what the API
+	// reports instead of the stopped or running state, as qBittorrent does:
+	// stop keeps it, start clears it, a recheck clears missingFiles.
+	errorState string
 }
 
 func (t *fakeTorrent) hasTag(tag string) bool {
@@ -159,12 +163,15 @@ func (f *fakeQbit) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				shown = t.dn
 			}
 			progress := 1.0
+			state := t.state
 			if t.checking {
 				progress = t.checkProgress
+			} else if t.errorState != "" {
+				state = t.errorState
 			}
 			out = append(out, qbTorrent{
 				Hash: t.hash, Name: shown, SavePath: t.savePath,
-				ContentPath: filepath.Join(t.savePath, t.name), State: t.state,
+				ContentPath: filepath.Join(t.savePath, t.name), State: state,
 				Category: t.category, MagnetURI: t.magnet, Size: size,
 				Completed: completed, Progress: progress, AddedOn: addedOn,
 				NumSeeds: 1, ETA: 8640000, Tags: strings.Join(t.tags, ", "),
@@ -213,7 +220,7 @@ func (f *fakeQbit) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		// During a check the torrent is already "started" for its sake: start
 		// changes nothing, and the stop after the check stays in effect.
 		if t := f.find(hash); t != nil && !t.checking {
-			t.state = "uploading"
+			t.state, t.errorState = "uploading", ""
 		}
 	case "/api/v2/torrents/setForceStart":
 		f.calls = append(f.calls, "forceStart="+r.Form.Get("value"))
@@ -289,6 +296,9 @@ func (f *fakeQbit) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 					elapsed := time.Since(started)
 					if elapsed >= total {
 						t.checking, t.checkActive = false, false
+						if t.errorState == "missingFiles" {
+							t.errorState = ""
+						}
 						if t.stopAfterCheck {
 							t.state = "stoppedUP"
 						} else {
