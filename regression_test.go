@@ -1506,3 +1506,23 @@ func deref(s *string) string {
 	}
 	return *s
 }
+
+// Errors of requests to qBittorrent reach clients in operation errors, and
+// the query of those requests names the torrent by its infohash.
+func TestQbitErrorsDoNotCarryInfohash(t *testing.T) {
+	env := newTestEnv(t)
+	hash := env.fake.torrents[0].hash
+	env.fake.mu.Lock()
+	env.fake.failInfo = true
+	env.fake.mu.Unlock()
+	if _, err := env.qb.torrent(hash); err == nil || strings.Contains(err.Error(), hash) {
+		t.Fatalf("err = %v", err)
+	}
+	dead, err := newQbit("http://127.0.0.1:1", "u", "p")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := dead.files(hash); err == nil || strings.Contains(err.Error(), hash) {
+		t.Fatalf("transport err = %v", err)
+	}
+}

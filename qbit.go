@@ -142,7 +142,19 @@ func (q *qbit) do(method, path string, form url.Values) (*http.Response, error) 
 	}
 	req.Header.Set("Referer", q.base.String())
 	req.Header.Set("Origin", q.base.String())
-	return q.hc.Do(req)
+	resp, err := q.hc.Do(req)
+	var urlErr *url.Error
+	if errors.As(err, &urlErr) {
+		// The query names the torrent by its infohash, and these errors reach
+		// clients; the path is enough to tell what failed.
+		urlErr.URL = q.base.String() + withoutQuery(path)
+	}
+	return resp, err
+}
+
+func withoutQuery(path string) string {
+	p, _, _ := strings.Cut(path, "?")
+	return p
 }
 
 func (q *qbit) login() error {
@@ -187,7 +199,7 @@ func (q *qbit) getJSON(path string, v any) error {
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("GET %s: HTTP %d", path, resp.StatusCode)
+		return fmt.Errorf("GET %s: HTTP %d", withoutQuery(path), resp.StatusCode)
 	}
 	return json.NewDecoder(resp.Body).Decode(v)
 }
@@ -222,7 +234,7 @@ func (q *qbit) getText(path string, out *string) error {
 	defer resp.Body.Close()
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<10))
 	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("GET %s: HTTP %d", path, resp.StatusCode)
+		return fmt.Errorf("GET %s: HTTP %d", withoutQuery(path), resp.StatusCode)
 	}
 	*out = strings.TrimSpace(string(body))
 	return nil
