@@ -87,6 +87,14 @@ type qbCategory struct {
 	SavePath string `json:"savePath"`
 }
 
+func (q *qbit) categories() (map[string]qbCategory, error) {
+	var raw map[string]qbCategory
+	if err := q.getJSON("/api/v2/torrents/categories", &raw); err != nil {
+		return nil, err
+	}
+	return raw, nil
+}
+
 type qbFile struct {
 	Index    *int    `json:"index"` // in API >= 2.8.2; otherwise the array position
 	Name     string  `json:"name"`

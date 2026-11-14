@@ -132,8 +132,8 @@ func (s *server) handleCategories(w http.ResponseWriter, _ *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]any{"categories": []any{}})
 		return
 	}
-	var raw map[string]qbCategory
-	if err := s.qb.getJSON("/api/v2/torrents/categories", &raw); err != nil {
+	raw, err := s.qb.categories()
+	if err != nil {
 		// An empty list would mean "no categories", and the client would silently
 		// send the torrent to the default category. An error must stay an error.
 		writeErr(w, http.StatusBadGateway, codeQbitUnavailable, "qbittorrent categories: %v", err)

@@ -41,6 +41,9 @@ type server struct {
 	// A file the player is reading right now must not be zeroed.
 	streams *streamRegistry
 
+	// Top-level folders that are qBittorrent categories, as last learned.
+	categories categoryDirs
+
 	// File deletions within one item are collected into a batch after a quiet
 	// period, so several episodes need only one stop and one recheck.
 	deleteMu       sync.Mutex

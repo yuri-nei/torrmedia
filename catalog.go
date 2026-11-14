@@ -17,6 +17,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 )
 
 // qbTorrentSnapshot is a torrent together with its file list, captured in a
@@ -216,7 +217,11 @@ func (s *server) buildCatalog() *catalog {
 		}
 	}
 
-	for _, shelf := range s.shelfItems(claimed) {
+	categories := s.categories.known()
+	if cat.qbitOK {
+		categories = s.learnCategories(torrents)
+	}
+	for _, shelf := range s.shelfItems(claimed, categories) {
 		if _, clash := cat.byID[shelf.id]; clash {
 			continue
 		}
@@ -358,9 +363,70 @@ func normalizeETA(eta int64) *int64 {
 	return &eta
 }
 
+// categoryDirs remembers which top-level folders are qBittorrent categories.
+// The catalog needs it to tell a category from an item that was added without
+// one once no torrent claims that item's folder: after the torrent is removed
+// with its files kept, or while qBittorrent is unavailable.
+type categoryDirs struct {
+	mu   sync.Mutex
+	dirs map[string]bool // lower-cased folder names; nil until first learned
+}
+
+func (c *categoryDirs) known() map[string]bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.dirs
+}
+
+// learnCategories refreshes the category folders from qBittorrent: the
+// category names (a category's default folder is its name), their save
+// paths, and the folders of categorized torrents. If the request fails, the
+// last known set stays.
+func (s *server) learnCategories(torrents []qbTorrentSnapshot) map[string]bool {
+	if s.qb == nil {
+		return nil
+	}
+	cats, err := s.qb.categories()
+	if err != nil {
+		log.Printf("catalog: categories: %v", err)
+		return s.categories.known()
+	}
+	dirs := map[string]bool{}
+	addTop := func(rel string) {
+		if top, _, _ := strings.Cut(filepath.ToSlash(rel), "/"); top != "" && top != "." && top != ".." {
+			dirs[strings.ToLower(top)] = true
+		}
+	}
+	addPath := func(path string) {
+		if !filepath.IsAbs(path) {
+			addTop(path)
+		} else if rel, ok := s.relToRoot(path); ok {
+			addTop(rel)
+		}
+	}
+	for name, c := range cats {
+		addTop(name)
+		if c.SavePath != "" {
+			addPath(c.SavePath)
+		}
+	}
+	for i := range torrents {
+		if torrents[i].Category != "" && torrents[i].SavePath != "" {
+			addPath(torrents[i].SavePath)
+		}
+	}
+	s.categories.mu.Lock()
+	s.categories.dirs = dirs
+	s.categories.mu.Unlock()
+	return dirs
+}
+
 // shelfItems finds items not backed by any torrent: top-level folders inside
-// categories and standalone files in the root.
-func (s *server) shelfItems(claimed map[string]bool) []*catalogItem {
+// categories and standalone files in the root. A top-level folder that is not
+// a known category and holds files directly is an item added without a
+// category, not a category. Until the categories are known, every top-level
+// folder is taken for a category.
+func (s *server) shelfItems(claimed map[string]bool, categories map[string]bool) []*catalogItem {
 	items := []*catalogItem{}
 	add := func(abs string, dir bool) {
 		rel, ok := s.relToRoot(abs)
@@ -411,13 +477,17 @@ func (s *server) shelfItems(claimed map[string]bool) []*catalogItem {
 		if rel, ok := s.relToRoot(abs); ok && claimed[rel] {
 			continue
 		}
-		// The remaining top-level folders are qBittorrent categories; they are
-		// transparent.
 		sub, err := os.ReadDir(abs)
 		if err != nil {
 			log.Printf("shelf: read %q: %v", abs, err)
 			continue
 		}
+		if categories != nil && !categories[strings.ToLower(entry.Name())] && holdsFiles(sub) {
+			add(abs, true)
+			continue
+		}
+		// The remaining top-level folders are qBittorrent categories; they are
+		// transparent.
 		for _, child := range sub {
 			if hidden(child.Name()) {
 				continue
@@ -432,6 +502,15 @@ func (s *server) shelfItems(claimed map[string]bool) []*catalogItem {
 		}
 	}
 	return items
+}
+
+func holdsFiles(entries []fs.DirEntry) bool {
+	for _, e := range entries {
+		if !hidden(e.Name()) && e.Type().IsRegular() {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *server) shelfFile(abs, shelfRel, within string) (catalogFile, bool) {

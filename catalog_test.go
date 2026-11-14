@@ -310,3 +310,64 @@ func TestTorrentTitle(t *testing.T) {
 		}
 	}
 }
+
+// Once no torrent claimed it, the folder of an item added without a category
+// was taken for a category again: after the torrent was removed with its
+// files kept, or while qBittorrent was unavailable, the item fell apart into
+// one item per file, and its id (which must survive removing the torrent)
+// disappeared.
+func TestRootItemStaysWholeWithoutItsTorrent(t *testing.T) {
+	root := testRoot(t)
+	const size = int64(1 << 20)
+	writeTestFile(t, filepath.Join(root, "Release", "e01.mkv"), size)
+	writeTestFile(t, filepath.Join(root, "Release", "e02.mkv"), size)
+	// A folder of folders that is not a category stays transparent.
+	writeTestFile(t, filepath.Join(root, "Cartoons", "Show", "e01.mkv"), size)
+
+	fake := newFakeQbit(&fakeTorrent{
+		hash: "0123456789012345678901234567890123456789", name: "Release",
+		savePath: root, state: "stoppedUP",
+		files: []fakeFile{
+			{name: filepath.Join("Release", "e01.mkv"), size: size, priority: 1, progress: 1},
+			{name: filepath.Join("Release", "e02.mkv"), size: size, priority: 1, progress: 1},
+		},
+	})
+	env := newTestEnvWith(t, root, fake)
+
+	titles := func(cat *catalog) map[string]int {
+		out := map[string]int{}
+		for _, item := range cat.items {
+			out[item.title] = len(item.files)
+		}
+		return out
+	}
+	before := env.buildCatalog()
+	release := ""
+	for _, item := range before.items {
+		if item.title == "Release" {
+			release = item.id
+		}
+	}
+	if release == "" {
+		t.Fatalf("items=%v", titles(before))
+	}
+
+	fake.mu.Lock()
+	fake.torrents = nil
+	fake.mu.Unlock()
+	removed := env.buildCatalog()
+	if got := titles(removed); len(got) != 2 || got["Release"] != 2 || got["Show"] != 1 {
+		t.Fatalf("after removing the torrent: items=%v, want Release (2 files) and Show", got)
+	}
+	if removed.item(release) == nil {
+		t.Fatal("the item lost its id when the torrent was removed")
+	}
+
+	fake.mu.Lock()
+	fake.failInfo = true
+	fake.mu.Unlock()
+	outage := env.buildCatalog()
+	if got := titles(outage); got["Release"] != 2 {
+		t.Fatalf("during an outage: items=%v", got)
+	}
+}
