@@ -182,3 +182,119 @@ func TestCrossSiteReadsAreAllowed(t *testing.T) {
 		}
 	}
 }
+
+// DNS rebinding: a page on the attacker's domain points that domain at this
+// server and then talks to it same-origin. Only Host gives it away, so a
+// name the server was not told about is refused on every route.
+func TestHostMustBeKnown(t *testing.T) {
+	env := newTestEnv(t)
+	_, item := env.firstItem(t)
+	stream := "/items/" + item.id + "/files/" + item.files[0].id + "/stream/e01.mkv"
+
+	for _, host := range []string{
+		"192.168.1.10:8091", "192.168.1.10", "[::1]:8091", "[::1]",
+		"[fe80::1%25en0]:8091",
+		"localhost", "localhost:8091", "LocalHost", "tv.localhost:8091",
+		"mac-mini.local", "Mac-Mini.local.:8091",
+	} {
+		req := newClientRequest(http.MethodGet, "/health", "", "")
+		req.Host = host
+		if rec := env.send(t, req); rec.Code != http.StatusOK {
+			t.Fatalf("Host %q: status=%d body=%s", host, rec.Code, rec.Body)
+		}
+	}
+
+	for _, host := range []string{
+		"evil.example", "evil.example:8091", "EVIL.example.", "example.com",
+		"localhost.evil.example", "mac-mini.local.evil.example",
+		"192.168.1.10.nip.io", "local", "",
+	} {
+		for _, c := range []struct{ method, path string }{
+			{http.MethodGet, "/health"},
+			{http.MethodGet, "/items"},
+			{http.MethodGet, "/events"},
+			{http.MethodGet, stream},
+			{http.MethodHead, stream},
+			{http.MethodDelete, "/items/" + item.id + "?delete_files=true"},
+		} {
+			req := newClientRequest(c.method, c.path, "", "")
+			req.Host = host
+			rec := env.send(t, req)
+			label := c.method + " " + c.path + " Host " + strconv.Quote(host)
+			expectError(t, label, rec, http.StatusMisdirectedRequest, codeMisdirected)
+			if msg := decodeJSON[apiError](t, rec.Body.Bytes()).Error; !strings.Contains(msg, "TORRMEDIA_HOSTS") {
+				t.Fatalf("%s: the error does not say how to allow the name: %q", label, msg)
+			}
+		}
+	}
+	if calls := env.fake.snapshotCalls(); len(calls) != 0 {
+		t.Fatalf("a request for a foreign host reached qBittorrent: %v", calls)
+	}
+}
+
+// The host check comes before the token: a rebound page has no token, and a
+// wrong name must be told apart from a wrong token.
+func TestHostIsCheckedBeforeToken(t *testing.T) {
+	env := newTestEnv(t)
+	env.token = "secret"
+	req := newClientRequest(http.MethodGet, "/items", "", "")
+	req.Host = "evil.example:8091"
+	req.Header.Set("Authorization", "Bearer secret")
+	expectError(t, "foreign host with token", env.send(t, req), http.StatusMisdirectedRequest, codeMisdirected)
+}
+
+func TestHostAllowlistFromEnvironment(t *testing.T) {
+	env := newTestEnv(t)
+	env.hosts = parseHostAllowlist(" Media.Example.org, ,.TS.net.,, ")
+
+	for host, want := range map[string]int{
+		"media.example.org":             http.StatusOK,
+		"MEDIA.example.org:8091":        http.StatusOK,
+		"media.example.org.":            http.StatusOK,
+		"mac-mini.tail1234.ts.net":      http.StatusOK,
+		"mac-mini.tail1234.ts.net:8091": http.StatusOK,
+		"example.org":                   http.StatusMisdirectedRequest,
+		"other.example.org":             http.StatusMisdirectedRequest,
+		"media.example.org.evil":        http.StatusMisdirectedRequest,
+		"ts.net":                        http.StatusMisdirectedRequest, // the suffix needs a label in front
+		"evilts.net":                    http.StatusMisdirectedRequest, // and starts at a dot
+		"evil.example":                  http.StatusMisdirectedRequest,
+	} {
+		req := newClientRequest(http.MethodGet, "/health", "", "")
+		req.Host = host
+		if rec := env.send(t, req); rec.Code != want {
+			t.Fatalf("Host %q: status=%d body=%s, want %d", host, rec.Code, rec.Body, want)
+		}
+	}
+	if got := parseHostAllowlist(" , ,"); got.names != nil || got.suffixes != nil {
+		t.Fatalf("empty entries were kept: %+v", got)
+	}
+}
+
+// Over a real connection the Host header is what the browser sends, not the
+// address it connected to: the rebound page reaches this server's IP with
+// its own name in Host.
+func TestHostCheckOverRealConnection(t *testing.T) {
+	env := newTestEnv(t)
+	srv := httptest.NewServer(env.routes())
+	defer srv.Close()
+
+	for host, want := range map[string]int{
+		"":                      http.StatusOK, // the client sends 127.0.0.1:port
+		"attacker.example:8091": http.StatusMisdirectedRequest,
+	} {
+		req, err := http.NewRequest(http.MethodGet, srv.URL+"/health", nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Host = host
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != want {
+			t.Fatalf("Host %q: status=%d, want %d", host, resp.StatusCode, want)
+		}
+	}
+}

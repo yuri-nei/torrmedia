@@ -29,10 +29,11 @@ const version = "2026-11-15.2"
 const defaultDeleteDebounce = 15 * time.Second
 
 type server struct {
-	root   string   // absolute, symlink-resolved, no trailing slash
-	osRoot *os.Root // all file operations go through it: no symlink can escape
-	token  string   // TORRMEDIA_TOKEN: if set, Authorization: Bearer is required
-	qb     *qbit    // nil if QBIT_URL is empty
+	root   string        // absolute, symlink-resolved, no trailing slash
+	osRoot *os.Root      // all file operations go through it: no symlink can escape
+	token  string        // TORRMEDIA_TOKEN: if set, Authorization: Bearer is required
+	hosts  hostAllowlist // TORRMEDIA_HOSTS: names served besides IPs, localhost and *.local
+	qb     *qbit         // nil if QBIT_URL is empty
 
 	// Operations on a single torrent are strictly sequential; otherwise two
 	// deletions would interleave stop, filePrio and recheck.
@@ -222,6 +223,7 @@ func main() {
 		root:              root,
 		osRoot:            osRoot,
 		token:             os.Getenv("TORRMEDIA_TOKEN"),
+		hosts:             parseHostAllowlist(os.Getenv("TORRMEDIA_HOSTS")),
 		deleteDebounce:    defaultDeleteDebounce,
 		operationTimeout:  5 * time.Minute,
 		pollInterval:      250 * time.Millisecond,

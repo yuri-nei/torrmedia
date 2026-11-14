@@ -518,6 +518,7 @@ func (e *testEnv) do(t *testing.T, method, path, body string) *httptest.Response
 		req = httptest.NewRequest(method, path, strings.NewReader(body))
 		req.Header.Set("Content-Type", "application/json")
 	}
+	req.Host = "127.0.0.1:8091" // a client names the server by address; httptest's default is example.com
 	rec := httptest.NewRecorder()
 	e.routes().ServeHTTP(rec, req)
 	return rec

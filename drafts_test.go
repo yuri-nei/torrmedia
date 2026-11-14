@@ -726,6 +726,7 @@ func TestDraftConfirmLosesToConcurrentDelete(t *testing.T) {
 	body := newHeldBody(`{"files":["` + ready.Files[0].ID + `"],"category":"Shows"}`)
 	req := httptest.NewRequest("POST", "/drafts/"+created.ID+"/confirm", body)
 	req.Header.Set("Content-Type", "application/json")
+	req.Host = "127.0.0.1:8091"
 	rec := httptest.NewRecorder()
 	served := make(chan struct{})
 	go func() {

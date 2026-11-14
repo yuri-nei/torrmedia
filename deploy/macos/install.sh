@@ -69,6 +69,8 @@ QBIT_USER=admin
 QBIT_PASS=CHANGE_ME
 
 # TORRMEDIA_TOKEN=
+# Host names clients use besides IP addresses and *.local, comma-separated:
+# TORRMEDIA_HOSTS=
 EOF
   chmod 0600 "$APP/config.env"
   echo "created $APP/config.env"

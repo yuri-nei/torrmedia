@@ -12,7 +12,9 @@ import (
 	"fmt"
 	"log"
 	"mime"
+	"net"
 	"net/http"
+	"net/netip"
 	"strings"
 )
 
@@ -30,6 +32,7 @@ const (
 	codeInternal             = "internal"
 	codeUnavailable          = "unavailable"
 	codeUnsupportedMediaType = "unsupported_media_type"
+	codeMisdirected          = "misdirected"
 )
 
 type apiError struct {
@@ -103,8 +106,101 @@ func isJSONMediaType(value string) bool {
 	return err == nil && mediaType == "application/json"
 }
 
+// hostAllowlist is TORRMEDIA_HOSTS, parsed once at startup: the names the
+// API may be reached by besides IP addresses, localhost and *.local. The zero
+// value allows none.
+type hostAllowlist struct {
+	names    map[string]bool // lower-case, without a trailing dot
+	suffixes []string        // ".example.org": any name ending in it
+}
+
+// parseHostAllowlist reads a comma-separated list of host names. An entry
+// starting with "." matches that suffix; case does not matter, and empty
+// entries are ignored.
+func parseHostAllowlist(raw string) hostAllowlist {
+	var list hostAllowlist
+	for _, entry := range strings.Split(raw, ",") {
+		entry = normalizeHostName(strings.TrimSpace(entry))
+		switch {
+		case entry == "":
+		case strings.HasPrefix(entry, "."):
+			list.suffixes = append(list.suffixes, entry)
+		default:
+			if list.names == nil {
+				list.names = map[string]bool{}
+			}
+			list.names[entry] = true
+		}
+	}
+	return list
+}
+
+func (l hostAllowlist) allows(host string) bool {
+	if l.names[host] {
+		return true
+	}
+	for _, suffix := range l.suffixes {
+		if strings.HasSuffix(host, suffix) {
+			return true
+		}
+	}
+	return false
+}
+
+// normalizeHostName lower-cases a host name and drops the trailing dot of a
+// fully qualified one: "Mac-Mini.local." and "mac-mini.local" are one name.
+func normalizeHostName(name string) string {
+	return strings.TrimSuffix(strings.ToLower(name), ".")
+}
+
+// requestHostName returns the host of a Host header value without the port
+// and without the brackets of an IPv6 literal.
+func requestHostName(hostport string) string {
+	host := hostport
+	if h, _, err := net.SplitHostPort(hostport); err == nil {
+		host = h
+	} else if len(host) > 1 && host[0] == '[' && host[len(host)-1] == ']' {
+		host = host[1 : len(host)-1]
+	}
+	return normalizeHostName(host)
+}
+
+// checkHost refuses a request addressed to a name this server was not told
+// about, which is what DNS rebinding looks like. A page on the attacker's
+// domain points that domain at this server's address once it has loaded; the
+// browser then sends the page's requests here as same-origin ones, so the
+// page reads every response and may use any method, with no preflight and no
+// Sec-Fetch-Site: cross-site. Only the Host header still carries the
+// attacker's name.
+//
+// An IP literal cannot be rebound. localhost and *.localhost resolve to
+// loopback in browsers, and *.local is multicast DNS, answered only on the
+// local link. Any other name has to be listed in TORRMEDIA_HOSTS. The check
+// covers every route, /health and streams included: a rebound page must not
+// read file names or video either.
+func (s *server) checkHost(r *http.Request) *denial {
+	host := requestHostName(r.Host)
+	if builtinHost(host) || s.hosts.allows(host) {
+		return nil
+	}
+	return deny(http.StatusMisdirectedRequest, codeMisdirected, fmt.Sprintf(
+		"host %q is not served here; to use this name, add it to TORRMEDIA_HOSTS", host))
+}
+
+func builtinHost(host string) bool {
+	if _, err := netip.ParseAddr(host); err == nil {
+		return true
+	}
+	return host == "localhost" || strings.HasSuffix(host, ".localhost") ||
+		strings.HasSuffix(host, ".local")
+}
+
 func (s *server) wrap(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if d := s.checkHost(r); d != nil {
+			writeDenial(w, d)
+			return
+		}
 		if d := checkForgery(r); d != nil {
 			writeDenial(w, d)
 			return

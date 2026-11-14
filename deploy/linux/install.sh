@@ -54,6 +54,8 @@ QBIT_PASS=CHANGE_ME
 # can reach the port. Either set a token or keep the port behind a
 # firewall/VPN. Details in README.
 # TORRMEDIA_TOKEN=
+# Host names clients use besides IP addresses and *.local, comma-separated:
+# TORRMEDIA_HOSTS=
 EOF
 fi
 chown root:torrmedia /etc/torrmedia/config.env
