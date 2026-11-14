@@ -34,9 +34,11 @@ func (s *server) startOperation(w http.ResponseWriter, kind, itemID string, file
 	go func() {
 		defer s.inflight.Done()
 		result, warnings, err := body(op)
-		switch {
-		case err != nil:
-			s.ops().fail(op.ID, err, warnings)
+		for i := range warnings {
+			warnings[i] = s.withoutRoot(warnings[i])
+		}
+		if err != nil {
+			s.ops().fail(op.ID, errors.New(s.withoutRoot(err.Error())), warnings)
 			return
 		}
 		s.ops().succeed(op.ID, warnings, result)
@@ -44,6 +46,17 @@ func (s *server) startOperation(w http.ResponseWriter, kind, itemID string, file
 
 	w.Header().Set("Location", "/operations/"+op.ID)
 	writeJSON(w, http.StatusAccepted, snapshot)
+}
+
+// withoutRoot drops the media root from a message that reaches the client:
+// operating system errors carry absolute paths, and disk paths are not part
+// of the API.
+func (s *server) withoutRoot(text string) string {
+	if s.root == "" {
+		return text
+	}
+	text = strings.ReplaceAll(text, s.root+string(filepath.Separator), "")
+	return strings.ReplaceAll(text, s.root, "")
 }
 
 // guardTorrent takes the per-torrent lock and refuses if a file delete is
@@ -391,7 +404,7 @@ func (s *server) runFileEnable(op *operation, hash string, index int) (map[strin
 	}
 	file, ok := qbFileByID(files, index)
 	if !ok {
-		return nil, warnings, fmt.Errorf("file %d disappeared from the torrent", index)
+		return nil, warnings, errFileGone
 	}
 	abs, err := s.torrentFilePath(t, file)
 	if err != nil {
@@ -483,7 +496,7 @@ func (s *server) runFilePriority(op *operation, hash string, index, priority int
 	}
 	file, ok := qbFileByID(files, index)
 	if !ok {
-		return nil, warnings, fmt.Errorf("file %d disappeared from the torrent", index)
+		return nil, warnings, errFileGone
 	}
 	// The file was excluded between rendering and the click: setting a priority
 	// would put it back into downloading, bypassing the space check enable does.

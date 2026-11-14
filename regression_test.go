@@ -1273,3 +1273,86 @@ func TestShelfRemoveFailsWhenNothingWasDeleted(t *testing.T) {
 		t.Fatalf("file should still be there: %v", err)
 	}
 }
+
+// Operation results and messages are part of the API, and the API promises
+// that infohashes, qBittorrent file ids and disk paths never leave the
+// server. A delete batch used to return "torrent": <infohash> and the file's
+// path in the library, and operating system errors carried absolute paths.
+func TestOperationsDoNotLeakInternals(t *testing.T) {
+	root := testRoot(t)
+	writeTestFile(t, filepath.Join(root, "shows", "Release", "small.mkv"), 100<<10)
+	writeTestFile(t, filepath.Join(root, "shows", "Release", "big.mkv"), 4<<20)
+	const hash = "0123456789012345678901234567890123456789"
+	fake := newFakeQbit(&fakeTorrent{
+		hash: hash, name: "Release", savePath: filepath.Join(root, "shows"),
+		category: "Shows", state: "stoppedUP",
+		files: []fakeFile{
+			{name: filepath.Join("Release", "small.mkv"), size: 100 << 10, priority: 1, progress: 1},
+			{name: filepath.Join("Release", "big.mkv"), size: 4 << 20, priority: 1, progress: 1},
+		},
+	})
+	env := newTestEnvWith(t, root, fake)
+	env.deleteDebounce = 150 * time.Millisecond
+	_, item := env.firstItem(t)
+
+	ops := map[string]string{}
+	for _, f := range item.files {
+		rec := env.do(t, http.MethodDelete, "/items/"+item.id+"/files/"+f.id, "")
+		if rec.Code != http.StatusAccepted {
+			t.Fatalf("delete %s: status=%d body=%s", f.name, rec.Code, rec.Body)
+		}
+		ops[f.name] = decodeJSON[operation](t, rec.Body.Bytes()).ID
+	}
+	for name, id := range ops {
+		if op := env.awaitOperation(t, id); op.State != opDone {
+			t.Fatalf("%s: %+v", name, op)
+		}
+		body := env.do(t, http.MethodGet, "/operations/"+id, "").Body.String()
+		for _, leak := range []string{hash, root, "shows/Release", `"torrent"`} {
+			if strings.Contains(body, leak) {
+				t.Fatalf("%s: operation leaks %q: %s", name, leak, body)
+			}
+		}
+		op := decodeJSON[operation](t, []byte(body))
+		kept := false
+		for _, w := range op.Warnings {
+			kept = kept || strings.Contains(w, "data kept")
+		}
+		// The small file is shorter than two pieces: its data stays on disk,
+		// and only its own operation says so.
+		if kept != (name == "small.mkv") {
+			t.Fatalf("%s: warnings=%v", name, op.Warnings)
+		}
+	}
+}
+
+func TestShelfRemoveWarningsHaveNoAbsolutePaths(t *testing.T) {
+	env := newTestEnv(t)
+	env.fake.mu.Lock()
+	env.fake.torrents = nil
+	env.fake.mu.Unlock()
+	_, item := env.firstItem(t)
+	// One file can be deleted, the other cannot: a partial removal is done
+	// with a warning.
+	locked := filepath.Join(env.root, "shows", "Release", "locked")
+	if err := os.MkdirAll(locked, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writeTestFile(t, filepath.Join(locked, "e03.mkv"), 1<<20)
+	if err := os.Chmod(locked, 0o555); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.Chmod(locked, 0o755) })
+	_, item = env.firstItem(t)
+
+	rec := env.do(t, http.MethodDelete, "/items/"+item.id+"?delete_files=true", "")
+	op := env.awaitOperation(t, decodeJSON[operation](t, rec.Body.Bytes()).ID)
+	if len(op.Warnings) == 0 {
+		t.Fatalf("expected a warning for the locked file: %+v", op)
+	}
+	for _, w := range op.Warnings {
+		if strings.Contains(w, env.root) {
+			t.Fatalf("warning carries an absolute path: %q", w)
+		}
+	}
+}

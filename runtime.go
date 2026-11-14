@@ -16,6 +16,9 @@ import (
 // answer". Without this distinction any network error turned into a 404.
 var errTorrentNotFound = errors.New("torrent not found")
 
+// errFileGone: the file is no longer part of the torrent.
+var errFileGone = errors.New("the file is no longer part of the torrent")
+
 // inodeKey returns a stable file key that survives hardlinks and renames.
 // An empty string means "key unavailable".
 func inodeKey(info os.FileInfo) string {

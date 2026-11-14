@@ -54,15 +54,32 @@ type deleteBatchOutcome struct {
 	// perTarget: an invalid file no longer fails the whole batch. Each waiter
 	// gets the result of ITS OWN file, and the rest are carried through.
 	perTarget map[string]*deleteBatchOutcome
+
+	// ownWarnings are warnings about one file of the batch. They go only to
+	// that file's operations: the others used to get, say, a neighbour's
+	// "data kept on disk" as if it were about their own file.
+	ownWarnings map[string][]string
 }
 
 func (o *deleteBatchOutcome) forTarget(rel string) *deleteBatchOutcome {
-	if o != nil && o.perTarget != nil {
-		if own, ok := o.perTarget[rel]; ok {
-			return own
-		}
+	if o == nil {
+		return nil
 	}
-	return o
+	if own, ok := o.perTarget[rel]; ok {
+		return own
+	}
+	extra := o.ownWarnings[rel]
+	if len(extra) == 0 || o.response == nil {
+		return o
+	}
+	copied := *o
+	copied.response = make(map[string]any, len(o.response))
+	for k, v := range o.response {
+		copied.response[k] = v
+	}
+	general, _ := o.response["warnings"].([]string)
+	copied.response["warnings"] = append(append([]string{}, general...), extra...)
+	return &copied
 }
 
 type preparedDelete struct {
@@ -321,7 +338,7 @@ func (s *server) rollbackDeletePriorities(hash string, changed []*preparedDelete
 	var failures []string
 	for i := len(changed) - 1; i >= 0; i-- {
 		if err := s.qb.setFilePrio(hash, changed[i].target.match.fileID, changed[i].priority); err != nil {
-			failures = append(failures, fmt.Sprintf("file %d: %v", changed[i].target.match.fileID, err))
+			failures = append(failures, fmt.Sprintf("%s: %v", filepath.Base(changed[i].target.rel), err))
 		}
 	}
 	if len(failures) > 0 {
@@ -403,26 +420,26 @@ func (s *server) deleteTorrentBatch(hash string, targets []*deleteTarget) *delet
 	}
 	for _, target := range targets {
 		if target.match.hash != hash {
-			reject(target, http.StatusConflict, "file %q belongs to another torrent", target.rel)
+			reject(target, http.StatusConflict, "%s belongs to another torrent", filepath.Base(target.rel))
 			continue
 		}
 		if previous, exists := seenIDs[target.match.fileID]; exists {
 			reject(target, http.StatusConflict,
-				"torrent file id %d is referenced by both %q and %q",
-				target.match.fileID, previous, target.rel)
+				"%s and %s are the same file of the torrent",
+				filepath.Base(previous), filepath.Base(target.rel))
 			continue
 		}
 		seenIDs[target.match.fileID] = target.rel
 
 		qbFile, ok := qbFileByID(files, target.match.fileID)
 		if !ok {
-			reject(target, http.StatusConflict, "torrent file id %d disappeared", target.match.fileID)
+			reject(target, http.StatusConflict, "%s is no longer part of the torrent", filepath.Base(target.rel))
 			continue
 		}
 		currentAbs, err := s.torrentFilePath(torrent, qbFile)
 		if err != nil || filepath.Clean(currentAbs) != filepath.Clean(target.match.abs) {
 			reject(target, http.StatusConflict,
-				"torrent path for file id %d changed", target.match.fileID)
+				"%s moved inside the torrent", filepath.Base(target.rel))
 			continue
 		}
 		currentRel, err := filepath.Rel(s.root, currentAbs)
@@ -488,6 +505,7 @@ func (s *server) deleteTorrentBatch(hash string, targets []*deleteTarget) *delet
 	}
 
 	warnings := []string{}
+	ownWarnings := map[string][]string{}
 	// Every operation whose files the batch actually handles sees the phase.
 	phase := func(name string) {
 		seen := make(map[string]bool)
@@ -576,8 +594,8 @@ func (s *server) deleteTorrentBatch(hash string, targets []*deleteTarget) *delet
 			// Nothing to free, and zeroing would corrupt pieces of neighbouring
 			// files. The file is excluded from the torrent and its data stays on
 			// disk; say so honestly.
-			warnings = append(warnings, fmt.Sprintf(
-				"%s: excluded from the torrent, but data kept on disk (%v)", item.target.rel, err))
+			ownWarnings[item.target.rel] = append(ownWarnings[item.target.rel], fmt.Sprintf(
+				"%s: excluded from the torrent, but data kept on disk (%v)", filepath.Base(item.target.rel), err))
 			deleted = append(deleted, deletedFile{
 				path:    item.target.rel,
 				trimmed: trimResult{logicalSize: item.size},
@@ -644,7 +662,7 @@ func (s *server) deleteTorrentBatch(hash string, targets []*deleteTarget) *delet
 		totalFreed += item.trimmed.freed
 		totalRetained += item.trimmed.retained
 		fileResponse := map[string]any{
-			"path": item.path, "logical_size": item.trimmed.logicalSize,
+			"name": filepath.Base(item.path), "logical_size": item.trimmed.logicalSize,
 			"retained_boundary_bytes": item.trimmed.retained,
 			"freed_bytes_estimate":    item.trimmed.freed,
 		}
@@ -657,7 +675,7 @@ func (s *server) deleteTorrentBatch(hash string, targets []*deleteTarget) *delet
 		fileResponses = append(fileResponses, fileResponse)
 	}
 	resp := map[string]any{
-		"torrent": hash, "batch_size": len(deleted), "batch_deleted": fileResponses,
+		"batch_size": len(deleted), "batch_deleted": fileResponses,
 		"storage_trimmed": true, "freed_bytes_estimate": totalFreed,
 		"retained_boundary_bytes": totalRetained, "recheck": "complete",
 	}
@@ -682,7 +700,7 @@ func (s *server) deleteTorrentBatch(hash string, targets []*deleteTarget) *delet
 	resp["warnings"] = warnings
 	log.Printf("delete batch: torrent=%s files=%d freed=%d retained=%d warnings=%d",
 		hash, len(deleted), totalFreed, totalRetained, len(warnings))
-	return &deleteBatchOutcome{status: http.StatusOK, response: resp, perTarget: rejected}
+	return &deleteBatchOutcome{status: http.StatusOK, response: resp, perTarget: rejected, ownWarnings: ownWarnings}
 }
 
 func (s *server) torrentFilePath(t *qbTorrent, f *qbFile) (string, error) {

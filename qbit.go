@@ -325,10 +325,10 @@ func (q *qbit) torrent(hash string) (*qbTorrent, error) {
 		return nil, err
 	}
 	if len(torrents) == 0 {
-		return nil, fmt.Errorf("%w: %q", errTorrentNotFound, hash)
+		return nil, errTorrentNotFound
 	}
 	if len(torrents) != 1 {
-		return nil, fmt.Errorf("expected one torrent %q, got %d", hash, len(torrents))
+		return nil, fmt.Errorf("expected one torrent, got %d", len(torrents))
 	}
 	return &torrents[0], nil
 }
@@ -436,7 +436,7 @@ func (q *qbit) waitFilePriority(hash string, id, priority int, timeout, interval
 		}
 		f, ok := qbFileByID(files, id)
 		if !ok {
-			return false, fmt.Errorf("file id %d disappeared", id)
+			return false, errFileGone
 		}
 		return f.Priority == priority, nil
 	})
@@ -483,7 +483,7 @@ func (q *qbit) waitChecked(hash string, stall, interval time.Duration) (*qbTorre
 		}
 		t := findTorrent(all, hash)
 		if t == nil {
-			return nil, fmt.Errorf("%w: %q", errTorrentNotFound, hash)
+			return nil, errTorrentNotFound
 		}
 		now := time.Now()
 		if current := checkProgress(all); !maps.Equal(current, checks) {
@@ -535,14 +535,14 @@ func (q *qbit) waitRecheck(hash string, id int, stall, interval time.Duration) e
 		return err
 	}
 	if !qbitStoppedState(t.State) && !qbitErrorState(t.State) {
-		return fmt.Errorf("torrent unexpectedly left stopped state after recheck: %s", t.State)
+		return fmt.Errorf("torrent unexpectedly %s after recheck", normalizeState(t.State))
 	}
 	files, err := q.files(hash)
 	if err != nil {
 		return err
 	}
 	if _, ok := qbFileByID(files, id); !ok {
-		return fmt.Errorf("file id %d disappeared after recheck", id)
+		return errFileGone
 	}
 	return nil
 }
@@ -590,7 +590,7 @@ func (q *qbit) waitFilePriorities(hash string, ids []int, priority int, timeout,
 		for _, id := range ids {
 			f, ok := qbFileByID(files, id)
 			if !ok {
-				return false, fmt.Errorf("file id %d disappeared", id)
+				return false, errFileGone
 			}
 			if f.Priority != priority {
 				return false, nil

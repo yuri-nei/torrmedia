@@ -565,7 +565,7 @@ func (s *server) discardTorrent(tag, hash string) error {
 		return err
 	}
 	if !t.hasTag(tag) {
-		return fmt.Errorf("torrent %s is no longer a draft; refusing to delete its data", hash)
+		return errors.New("the torrent is no longer a draft; refusing to delete its data")
 	}
 	return s.qb.deleteTorrent(hash, true)
 }
