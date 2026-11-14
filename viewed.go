@@ -21,7 +21,6 @@ import (
 
 type viewedEntry struct {
 	Path    string `json:"path"`
-	Item    string `json:"item"`
 	Size    int64  `json:"size"`
 	Served  int64  `json:"served"`
 	Pos     int64  `json:"pos"`
@@ -187,14 +186,6 @@ func cleanRelative(rel string) (string, error) {
 	return clean, nil
 }
 
-func itemForPath(rel string) string {
-	parts := strings.Split(filepath.ToSlash(rel), "/")
-	if len(parts) < 2 {
-		return rel
-	}
-	return filepath.FromSlash(strings.Join(parts[:2], "/"))
-}
-
 func (s *server) viewedSize(rel string) int64 {
 	info, err := os.Stat(filepath.Join(s.root, rel))
 	if err != nil || !info.Mode().IsRegular() {
@@ -215,7 +206,6 @@ func (s *server) markViewed(shelfRel, state string) error {
 	return s.viewed.update(func(items map[string]viewedEntry) {
 		entry := items[rel]
 		entry.Path = rel
-		entry.Item = itemForPath(rel)
 		if size > 0 {
 			entry.Size = size
 		}
@@ -246,7 +236,6 @@ func (s *server) clearViewedFile(shelfRel string) error {
 	return s.viewed.update(func(items map[string]viewedEntry) {
 		entry := items[rel]
 		entry.Path = rel
-		entry.Item = itemForPath(rel)
 		if entry.Size == 0 {
 			entry.Size = s.viewedSize(rel)
 		}
@@ -273,7 +262,6 @@ func (s *server) clearViewedItem(shelfRel string) error {
 type playbackTracker struct {
 	server  *server
 	rel     string
-	item    string
 	size    int64
 	start   int64
 	total   atomic.Int64
@@ -286,7 +274,6 @@ func newPlaybackTracker(s *server, rel string, size, start int64) *playbackTrack
 	t := &playbackTracker{
 		server: s,
 		rel:    rel,
-		item:   itemForPath(rel),
 		size:   size,
 		start:  start,
 		stop:   make(chan struct{}),
@@ -323,7 +310,7 @@ func (t *playbackTracker) flush() {
 		return
 	}
 	t.flushed = total
-	if err := t.server.trackPlayback(t.rel, t.item, t.size, t.start, delta, total); err != nil {
+	if err := t.server.trackPlayback(t.rel, t.size, t.start, delta, total); err != nil {
 		log.Printf("track playback %q: %v", t.rel, err)
 	}
 }
@@ -406,7 +393,7 @@ func rangeStart(header string) int64 {
 	return start
 }
 
-func (s *server) trackPlayback(rel, item string, size, start, delta, requestTotal int64) error {
+func (s *server) trackPlayback(rel string, size, start, delta, requestTotal int64) error {
 	if s.viewed == nil || delta <= 0 {
 		return nil
 	}
@@ -414,7 +401,6 @@ func (s *server) trackPlayback(rel, item string, size, start, delta, requestTota
 	return s.viewed.update(func(items map[string]viewedEntry) {
 		entry, existed := items[rel]
 		entry.Path = rel
-		entry.Item = item
 		entry.Size = size
 		entry.Served += delta
 		entry.Updated = time.Now().Unix()

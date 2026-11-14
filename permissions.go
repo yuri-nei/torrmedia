@@ -59,7 +59,7 @@ func (s *server) permitItem(cat *catalog, item *catalogItem, action string) *den
 		return deny(http.StatusConflict, codeAmbiguous,
 			"this item shares files with another torrent; refusing to act on it")
 	}
-	if s.operations.busy(item.id) {
+	if s.ops().busy(item.id) {
 		return deny(http.StatusConflict, codeBusy, "an operation is already running for this item")
 	}
 	// Watched episodes can be deleted even from an item with no torrent: they
@@ -87,7 +87,7 @@ func (s *server) permitItem(cat *catalog, item *catalogItem, action string) *den
 		}
 	case actionRemove, actionRemoveWithData:
 	default:
-		return deny(http.StatusBadRequest, codeBadRequest, "unknown action %q")
+		return deny(http.StatusBadRequest, codeBadRequest, "unknown action")
 	}
 	return nil
 }
@@ -122,7 +122,7 @@ func (s *server) permitFile(cat *catalog, item *catalogItem, file *catalogFile, 
 		// finish. The hard guarantee that "the player never gets zeros" comes
 		// not from this rule but from the inode claims in streamRegistry; here
 		// it is only about keeping the actions list honest.
-		if s.operations.dooms(item.id, file.id) {
+		if s.ops().dooms(item.id, file.id) {
 			return deny(http.StatusConflict, codeBusy, "file is being deleted")
 		}
 		return nil
@@ -151,16 +151,16 @@ func (s *server) permitFile(cat *catalog, item *catalogItem, file *catalogFile, 
 	// per-torrent coordinator ensures ordering, and a duplicate inside the batch
 	// is cut off by file id. Checking busyness here would make batching
 	// unreachable.
-	busy := s.operations.busy(item.id)
+	busy := s.ops().busy(item.id)
 	if action == actionEnable {
-		busy = s.operations.busyBeyond(item.id, enableQueuesBehind...)
+		busy = s.ops().busyBeyond(item.id, enableQueuesBehind...)
 	}
 	if action != actionDelete && busy {
 		return deny(http.StatusConflict, codeBusy, "an operation is already running for this item")
 	}
 	// A delete does queue up behind other operations, but not behind removing
 	// the item: by the time the batch runs, the torrent is gone.
-	if action == actionDelete && s.operations.runningKind(item.id, opItemRemove, opItemRemoveWithData) {
+	if action == actionDelete && s.ops().runningKind(item.id, opItemRemove, opItemRemoveWithData) {
 		return deny(http.StatusConflict, codeBusy, "the item is being removed")
 	}
 	// A check that qBittorrent runs on its own (started from its Web UI, after
@@ -169,7 +169,7 @@ func (s *server) permitFile(cat *catalog, item *catalogItem, file *catalogFile, 
 	// operations runs, the check is ours, and delete and enable queue up
 	// behind it instead.
 	if (action == actionDelete || action == actionEnable) &&
-		item.status == statusChecking && !s.operations.busy(item.id) {
+		item.status == statusChecking && !s.ops().busy(item.id) {
 		return deny(http.StatusConflict, codeBusy, "item is being checked")
 	}
 	if file.ambiguous {

@@ -31,7 +31,7 @@ func newViewedPlayer(t *testing.T) (*viewedPlayer, *catalogItem) {
 // play is one request reading n bytes from start, flushed in one go.
 func (p *viewedPlayer) play(t *testing.T, start, n int64) {
 	t.Helper()
-	if err := p.env.trackPlayback(p.rel, itemForPath(p.rel), p.size, start, n, n); err != nil {
+	if err := p.env.trackPlayback(p.rel, p.size, start, n, n); err != nil {
 		t.Fatal(err)
 	}
 }

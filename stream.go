@@ -8,7 +8,6 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
-	"sort"
 	"strings"
 	"syscall"
 )
@@ -92,8 +91,6 @@ func totalFilesystemBytes(path string) (int64, error) {
 	}
 	return int64(st.Blocks) * int64(st.Bsize), nil
 }
-
-func sortStrings(v []string) { sort.Strings(v) }
 
 func validStreamInfo(before, current os.FileInfo) bool {
 	return before != nil && current != nil &&

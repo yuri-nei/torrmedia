@@ -7,7 +7,9 @@ package main
 // with DELETE).
 
 import (
+	"fmt"
 	"net/http"
+	"sort"
 	"strconv"
 	"strings"
 )
@@ -143,7 +145,7 @@ func (s *server) handleCategories(w http.ResponseWriter, _ *http.Request) {
 	for name := range raw {
 		names = append(names, name)
 	}
-	sortStrings(names)
+	sort.Strings(names)
 	out := make([]map[string]any, 0, len(names))
 	for _, name := range names {
 		out = append(out, map[string]any{"name": name})
@@ -472,13 +474,7 @@ func parseBoolQuery(r *http.Request, key string) (bool, error) {
 	}
 	value, err := strconv.ParseBool(raw)
 	if err != nil {
-		return false, errBadQuery(key)
+		return false, fmt.Errorf("%s must be true or false", key)
 	}
 	return value, nil
 }
-
-type queryError string
-
-func (e queryError) Error() string { return string(e) + " must be true or false" }
-
-func errBadQuery(key string) error { return queryError(key) }

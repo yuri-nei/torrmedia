@@ -86,7 +86,6 @@ type fakeQbit struct {
 	addSavePath    string
 	addFiles       []fakeFile
 	metadataIn     time.Duration // how long after add the file list appears
-	filesMissing   bool          // 404 before metadata, not an empty list
 	ignoreStopCond bool          // qBittorrent "does not support" stopCondition
 }
 
@@ -185,11 +184,6 @@ func (f *fakeQbit) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case "/api/v2/torrents/files":
 		t := f.find(hash)
 		if t == nil || t.hash == f.vanishing {
-			http.NotFound(w, r)
-			return
-		}
-		if len(t.files) == 0 && f.filesMissing {
-			// Until the magnet's metadata arrives, there is no file list.
 			http.NotFound(w, r)
 			return
 		}
