@@ -32,6 +32,10 @@ type fakeTorrent struct {
 	files    []fakeFile
 	tags     []string
 	addedOn  int64
+
+	checking       bool
+	stopAfterCheck bool
+	checkProgress  float64
 }
 
 func (t *fakeTorrent) hasTag(tag string) bool {
@@ -50,6 +54,7 @@ type fakeQbit struct {
 	calls     []string
 	failInfo  bool
 	recheckIn time.Duration
+	stateLag  time.Duration
 
 	addHash        string
 	addName        string
@@ -124,11 +129,15 @@ func (f *fakeQbit) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			if t.dn != "" {
 				shown = t.dn
 			}
+			progress := 1.0
+			if t.checking {
+				progress = t.checkProgress
+			}
 			out = append(out, qbTorrent{
 				Hash: t.hash, Name: shown, SavePath: t.savePath,
 				ContentPath: filepath.Join(t.savePath, t.name), State: t.state,
 				Category: t.category, MagnetURI: t.magnet, Size: size,
-				Completed: completed, Progress: 1, AddedOn: addedOn,
+				Completed: completed, Progress: progress, AddedOn: addedOn,
 				NumSeeds: 1, ETA: 8640000, Tags: strings.Join(t.tags, ", "),
 			})
 		}
@@ -167,10 +176,11 @@ func (f *fakeQbit) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		f.calls = append(f.calls, "stop")
 		if t := f.find(hash); t != nil {
 			t.state = "stoppedUP"
+			t.stopAfterCheck = t.checking
 		}
 	case "/api/v2/torrents/start", "/api/v2/torrents/resume":
 		f.calls = append(f.calls, "start")
-		if t := f.find(hash); t != nil {
+		if t := f.find(hash); t != nil && !t.checking {
 			t.state = "uploading"
 		}
 	case "/api/v2/torrents/setForceStart":
@@ -219,14 +229,35 @@ func (f *fakeQbit) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case "/api/v2/torrents/recheck":
 		f.calls = append(f.calls, "recheck")
 		t := f.find(hash)
-		if t != nil {
-			t.state = "checkingUP"
-			delay := f.recheckIn
+		if t != nil && !t.checking {
+			t.checking, t.checkProgress = true, 0
+			t.stopAfterCheck = qbitStoppedState(t.state)
+			lag, total := f.stateLag, f.recheckIn
+			if lag <= 0 {
+				t.state = "checkingUP"
+			}
+			issued := time.Now()
 			go func() {
-				time.Sleep(delay)
-				f.mu.Lock()
-				t.state = "stoppedUP"
-				f.mu.Unlock()
+				for {
+					time.Sleep(time.Millisecond)
+					f.mu.Lock()
+					elapsed := time.Since(issued)
+					if elapsed >= total {
+						t.checking = false
+						if t.stopAfterCheck {
+							t.state = "stoppedUP"
+						} else {
+							t.state = "uploading"
+						}
+						f.mu.Unlock()
+						return
+					}
+					if elapsed >= lag {
+						t.state = "checkingUP"
+					}
+					t.checkProgress = float64(elapsed) / float64(total)
+					f.mu.Unlock()
+				}
 			}()
 		}
 	case "/api/v2/torrents/delete":
@@ -333,6 +364,7 @@ func newTestEnvWith(t *testing.T, root string, fake *fakeQbit) *testEnv {
 	if err != nil {
 		t.Fatal(err)
 	}
+	qb.stateLag = 200 * time.Millisecond
 	store, err := newViewedStore(filepath.Join(t.TempDir(), "viewed.json"))
 	if err != nil {
 		t.Fatal(err)
@@ -361,6 +393,30 @@ func (e *testEnv) firstItem(t *testing.T) (*catalog, *catalogItem) {
 		t.Fatal("catalog is empty")
 	}
 	return cat, cat.items[0]
+}
+
+func (e *testEnv) realisticRecheck(total time.Duration) {
+	e.fake.mu.Lock()
+	defer e.fake.mu.Unlock()
+	e.fake.stateLag = 40 * time.Millisecond
+	e.fake.recheckIn = total
+}
+
+func (e *testEnv) settledState(t *testing.T) string {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		e.fake.mu.Lock()
+		checking, state := e.fake.torrents[0].checking, e.fake.torrents[0].state
+		e.fake.mu.Unlock()
+		if !checking {
+			return state
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("fake qBittorrent is still checking")
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
 }
 
 func (e *testEnv) awaitOperation(t *testing.T, id string) operation {

@@ -17,7 +17,10 @@ type qbit struct {
 	base       *url.URL
 	user, pass string
 	hc         *http.Client
+	stateLag   time.Duration
 }
+
+const qbitStateLag = 5 * time.Second
 
 type qbTorrent struct {
 	Hash         string  `json:"hash"`
@@ -88,7 +91,10 @@ func newQbit(rawURL, user, pass string) (*qbit, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &qbit{base: u, user: user, pass: pass, hc: &http.Client{Timeout: 15 * time.Second, Jar: jar}}, nil
+	return &qbit{
+		base: u, user: user, pass: pass, stateLag: qbitStateLag,
+		hc: &http.Client{Timeout: 15 * time.Second, Jar: jar},
+	}, nil
 }
 
 func (q *qbit) do(method, path string, form url.Values) (*http.Response, error) {
@@ -345,31 +351,61 @@ func (q *qbit) waitFilePriority(hash string, id, priority int, timeout, interval
 	})
 }
 
-func (q *qbit) waitRecheck(hash string, id int, timeout, interval time.Duration) error {
+func (q *qbit) waitChecked(hash string, stall, interval time.Duration) (*qbTorrent, error) {
+	if stall <= 0 {
+		return nil, errors.New("operation deadline exceeded")
+	}
+	if interval <= 0 {
+		interval = 250 * time.Millisecond
+	}
+	issued := time.Now()
+	moved := issued
+	seen := false
+	lastProgress := -1.0
 	settled := 0
 	const requiredSettled = 2
-	return pollUntil(timeout, interval, func() (bool, error) {
+	for {
 		t, err := q.torrent(hash)
 		if err != nil {
-			return false, err
+			return nil, err
 		}
-		if qbitCheckingState(t.State) {
-			settled = 0
-			return false, nil
+		now := time.Now()
+		switch {
+		case qbitCheckingState(t.State):
+			seen, settled = true, 0
+			if t.Progress != lastProgress {
+				lastProgress, moved = t.Progress, now
+			}
+		case !seen && now.Sub(issued) < q.stateLag:
+		default:
+			settled++
+			if settled >= requiredSettled {
+				return t, nil
+			}
 		}
-		if !qbitStoppedState(t.State) {
-			return false, fmt.Errorf("torrent unexpectedly left stopped state after recheck: %s", t.State)
+		if now.Sub(moved) > stall {
+			return nil, fmt.Errorf("recheck made no progress for %s", stall)
 		}
-		files, err := q.files(hash)
-		if err != nil {
-			return false, err
-		}
-		if _, ok := qbFileByID(files, id); !ok {
-			return false, fmt.Errorf("file id %d disappeared after recheck", id)
-		}
-		settled++
-		return settled >= requiredSettled, nil
-	})
+		time.Sleep(interval)
+	}
+}
+
+func (q *qbit) waitRecheck(hash string, id int, stall, interval time.Duration) error {
+	t, err := q.waitChecked(hash, stall, interval)
+	if err != nil {
+		return err
+	}
+	if !qbitStoppedState(t.State) {
+		return fmt.Errorf("torrent unexpectedly left stopped state after recheck: %s", t.State)
+	}
+	files, err := q.files(hash)
+	if err != nil {
+		return err
+	}
+	if _, ok := qbFileByID(files, id); !ok {
+		return fmt.Errorf("file id %d disappeared after recheck", id)
+	}
+	return nil
 }
 
 func (q *qbit) recheck(hash string) error {
@@ -437,18 +473,7 @@ func (q *qbit) addForm(fields map[string]string) error {
 	return q.postOK("/api/v2/torrents/add", form)
 }
 
-func (q *qbit) waitCheckDone(hash string, timeout, interval time.Duration) error {
-	settled := 0
-	return pollUntil(timeout, interval, func() (bool, error) {
-		t, err := q.torrent(hash)
-		if err != nil {
-			return false, err
-		}
-		if qbitCheckingState(t.State) {
-			settled = 0
-			return false, nil
-		}
-		settled++
-		return settled >= 2, nil
-	})
+func (q *qbit) waitCheckDone(hash string, stall, interval time.Duration) error {
+	_, err := q.waitChecked(hash, stall, interval)
+	return err
 }

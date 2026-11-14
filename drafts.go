@@ -360,15 +360,11 @@ func (s *server) confirmDraft(id string, wanted map[string]bool, category string
 	s.poke()
 
 	if len(wanted) > 0 {
-		startTimeout := 30 * time.Second
-		if s.operationTimeout < startTimeout {
-			startTimeout = s.operationTimeout
-		}
 		if err := s.qb.switchTorrent(current.hash, "start"); err != nil {
 			s.failDraft(id, fmt.Errorf("item was added but did not start: %w", err))
 			return
 		}
-		if _, err := s.qb.waitStarted(current.hash, startTimeout, s.pollInterval); err != nil {
+		if _, err := s.qb.waitStarted(current.hash, s.startTimeout(), s.pollInterval); err != nil {
 			s.failDraft(id, fmt.Errorf("item was added but did not start: %w", err))
 			return
 		}

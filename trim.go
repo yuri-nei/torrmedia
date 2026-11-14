@@ -499,7 +499,14 @@ func (s *server) deleteTorrentBatch(hash string, targets []*deleteTarget) *delet
 			if rcErr := s.qb.recheck(hash); rcErr != nil {
 				note = fmt.Sprintf("recheck also failed: %v", rcErr)
 			} else if wasRunning {
-				if startErr := s.qb.switchTorrent(hash, "start"); startErr != nil {
+				startErr := s.qb.waitCheckDone(hash, s.operationTimeout, s.pollInterval)
+				if startErr == nil {
+					startErr = s.qb.switchTorrent(hash, "start")
+				}
+				if startErr == nil {
+					_, startErr = s.qb.waitStarted(hash, s.startTimeout(), s.pollInterval)
+				}
+				if startErr != nil {
 					note = fmt.Sprintf("restart failed: %v", startErr)
 				} else {
 					note = "torrent restarted to repair neighbouring pieces"
@@ -519,11 +526,7 @@ func (s *server) deleteTorrentBatch(hash string, targets []*deleteTarget) *delet
 		out.perTarget = rejected
 		return out
 	}
-	left, err := budget()
-	if err == nil {
-		err = s.qb.waitRecheck(hash, prepared[0].target.match.fileID, left, s.pollInterval)
-	}
-	if err != nil {
+	if err := s.qb.waitRecheck(hash, prepared[0].target.match.fileID, s.operationTimeout, s.pollInterval); err != nil {
 		out := deleteBatchError(http.StatusGatewayTimeout,
 			"files trimmed, but qbittorrent recheck did not finish; torrent left stopped: %v", err)
 		out.perTarget = rejected
@@ -554,7 +557,11 @@ func (s *server) deleteTorrentBatch(hash string, targets []*deleteTarget) *delet
 		"retained_boundary_bytes": totalRetained, "recheck": "complete",
 	}
 	if wasRunning {
-		if err := s.qb.switchTorrent(hash, "start"); err != nil {
+		err := s.qb.switchTorrent(hash, "start")
+		if err == nil {
+			_, err = s.qb.waitStarted(hash, s.startTimeout(), s.pollInterval)
+		}
+		if err != nil {
 			warnings = append(warnings, fmt.Sprintf("torrent was not restarted: %v", err))
 			log.Printf("delete batch: restart %s failed after successful trim: %v", hash, err)
 		} else {

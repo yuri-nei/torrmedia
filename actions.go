@@ -81,7 +81,7 @@ func (s *server) runItemCommand(op *operation, hash, action string) (map[string]
 		if err := s.qb.recheck(hash); err != nil {
 			return nil, warnings, err
 		}
-		if err := s.qb.waitCheckDone(hash, budget(), s.pollInterval); err != nil {
+		if err := s.qb.waitCheckDone(hash, s.operationTimeout, s.pollInterval); err != nil {
 			return nil, warnings, err
 		}
 	default:
@@ -308,6 +308,10 @@ func (s *server) lockAfterDeletes(op *operation, hash string) (func(), error) {
 	}
 }
 
+func (s *server) startTimeout() time.Duration {
+	return min(30*time.Second, s.operationTimeout)
+}
+
 func (s *server) runFileEnable(op *operation, hash string, index int) (map[string]any, []string, error) {
 	unlock, err := s.lockAfterDeletes(op, hash)
 	if err != nil {
@@ -380,11 +384,7 @@ func (s *server) runFileEnable(op *operation, hash string, index int) (map[strin
 		rollback()
 		return nil, warnings, err
 	}
-	startTimeout := 30 * time.Second
-	if s.operationTimeout < startTimeout {
-		startTimeout = s.operationTimeout
-	}
-	after, err := s.qb.waitStarted(hash, startTimeout, s.pollInterval)
+	after, err := s.qb.waitStarted(hash, s.startTimeout(), s.pollInterval)
 	if err != nil {
 		if stopErr := s.qb.switchTorrent(hash, "stop"); stopErr != nil {
 			warnings = append(warnings, fmt.Sprintf("stop also failed: %v", stopErr))

@@ -659,6 +659,145 @@ func TestSeveralDeletesOfOneItemBatchTogether(t *testing.T) {
 	}
 }
 
+func TestEnableQueuesBehindDeleteOfNeighbour(t *testing.T) {
+	env := newTestEnv(t)
+	env.deleteDebounce = 150 * time.Millisecond
+	env.realisticRecheck(120 * time.Millisecond)
+	env.fake.mu.Lock()
+	env.fake.torrents[0].files[1].priority = 0
+	env.fake.mu.Unlock()
+	_, item := env.firstItem(t)
+	watched, next := item.files[0], item.files[1]
+
+	rec := env.do(t, http.MethodDelete, "/items/"+item.id+"/files/"+watched.id, "")
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("delete: status=%d body=%s", rec.Code, rec.Body)
+	}
+	deleteOp := decodeJSON[operation](t, rec.Body.Bytes()).ID
+
+	detail := decodeJSON[apiItemDetail](t, env.do(t, http.MethodGet, "/items/"+item.id, "").Body.Bytes())
+	if len(detail.Actions) != 0 {
+		t.Fatalf("item actions while deleting: %v", detail.Actions)
+	}
+	for _, f := range detail.Files {
+		if f.ID == next.id && !contains(f.Actions, actionEnable) {
+			t.Fatalf("enable is not offered while a neighbour is being deleted: %+v", f)
+		}
+	}
+
+	rec = env.do(t, http.MethodPost, "/items/"+item.id+"/files/"+next.id+"/enable", "")
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("enable: status=%d body=%s", rec.Code, rec.Body)
+	}
+	enableOp := decodeJSON[operation](t, rec.Body.Bytes()).ID
+
+	for _, id := range []string{deleteOp, enableOp} {
+		if op := env.awaitOperation(t, id); op.State != opDone {
+			t.Fatalf("operation %s: %+v", id, op)
+		}
+	}
+
+	calls := env.fake.snapshotCalls()
+	index := func(call string) int {
+		for i, c := range calls {
+			if c == call {
+				return i
+			}
+		}
+		t.Fatalf("no %q in %v", call, calls)
+		return -1
+	}
+	recheck, enable, start := index("recheck"), index("prio1:1"), index("start")
+	if !(index("prio0:0") < recheck && recheck < enable && enable < start) {
+		t.Fatalf("enable must run after the delete batch and start the torrent: %v", calls)
+	}
+	if state := env.settledState(t); qbitStoppedState(state) {
+		t.Fatalf("torrent left %s: the enabled file would never download", state)
+	}
+}
+
+func TestDeleteAfterEnableKeepsTorrentRunning(t *testing.T) {
+	env := newTestEnv(t)
+	env.deleteDebounce = 50 * time.Millisecond
+	env.realisticRecheck(120 * time.Millisecond)
+	env.fake.mu.Lock()
+	env.fake.torrents[0].files[1].priority = 0
+	env.fake.mu.Unlock()
+	_, item := env.firstItem(t)
+	watched, next := item.files[0], item.files[1]
+
+	rec := env.do(t, http.MethodPost, "/items/"+item.id+"/files/"+next.id+"/enable", "")
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("enable: status=%d body=%s", rec.Code, rec.Body)
+	}
+	if op := env.awaitOperation(t, decodeJSON[operation](t, rec.Body.Bytes()).ID); op.State != opDone {
+		t.Fatalf("enable: %+v", op)
+	}
+
+	env.catalog.Store(env.buildCatalog())
+	rec = env.do(t, http.MethodDelete, "/items/"+item.id+"/files/"+watched.id, "")
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("delete: status=%d body=%s", rec.Code, rec.Body)
+	}
+	if op := env.awaitOperation(t, decodeJSON[operation](t, rec.Body.Bytes()).ID); op.State != opDone {
+		t.Fatalf("delete: %+v", op)
+	}
+
+	calls := env.fake.snapshotCalls()
+	if len(calls) == 0 || calls[len(calls)-1] != "start" {
+		t.Fatalf("delete batch must end by restarting the running torrent: %v", calls)
+	}
+	state := env.settledState(t)
+	env.fake.mu.Lock()
+	prio := env.fake.torrents[0].files[1].priority
+	env.fake.mu.Unlock()
+	if qbitStoppedState(state) || prio == 0 {
+		t.Fatalf("after the batch: state=%s e02 priority=%d", state, prio)
+	}
+}
+
+func TestLongRecheckStillRestartsTorrent(t *testing.T) {
+	env := newTestEnv(t)
+	env.deleteDebounce = 20 * time.Millisecond
+	env.operationTimeout = 300 * time.Millisecond
+	env.realisticRecheck(900 * time.Millisecond)
+	env.fake.mu.Lock()
+	env.fake.torrents[0].state = "downloading"
+	env.fake.mu.Unlock()
+	_, item := env.firstItem(t)
+
+	rec := env.do(t, http.MethodDelete, "/items/"+item.id+"/files/"+item.files[0].id, "")
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("delete: status=%d body=%s", rec.Code, rec.Body)
+	}
+	if op := env.awaitOperation(t, decodeJSON[operation](t, rec.Body.Bytes()).ID); op.State != opDone {
+		t.Fatalf("delete: %+v", op)
+	}
+	if state := env.settledState(t); qbitStoppedState(state) {
+		t.Fatalf("torrent left %s after a long recheck", state)
+	}
+}
+
+func TestItemRecheckWaitsForRealCheck(t *testing.T) {
+	env := newTestEnv(t)
+	env.realisticRecheck(150 * time.Millisecond)
+	_, item := env.firstItem(t)
+
+	rec := env.do(t, http.MethodPost, "/items/"+item.id+"/recheck", "")
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("recheck: status=%d body=%s", rec.Code, rec.Body)
+	}
+	if op := env.awaitOperation(t, decodeJSON[operation](t, rec.Body.Bytes()).ID); op.State != opDone {
+		t.Fatalf("recheck: %+v", op)
+	}
+	env.fake.mu.Lock()
+	checking := env.fake.torrents[0].checking
+	env.fake.mu.Unlock()
+	if checking {
+		t.Fatal("recheck operation finished while qBittorrent was still checking")
+	}
+}
+
 func TestFilePriorityOnlyForUnfinishedFiles(t *testing.T) {
 	env := newTestEnv(t)
 	abs := filepath.Join(env.root, "shows", "Release", "e01.mkv")
