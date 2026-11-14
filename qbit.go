@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"net/http"
 	"net/http/cookiejar"
 	"net/url"
@@ -252,12 +253,20 @@ func (q *qbit) filesIfKnown(hash string) ([]qbFile, bool, error) {
 	return files, true, nil
 }
 
+func (q *qbit) torrentList() ([]qbTorrent, error) {
+	var torrents []qbTorrent
+	if err := q.getJSON("/api/v2/torrents/info", &torrents); err != nil {
+		return nil, err
+	}
+	return torrents, nil
+}
+
 // torrentsWithTag filters the list itself instead of using qBittorrent's tag=
 // parameter: there are only dozens of torrents here, and in return the
 // behaviour doesn't depend on the WebAPI version.
 func (q *qbit) torrentsWithTag(tag string) ([]qbTorrent, error) {
-	var torrents []qbTorrent
-	if err := q.getJSON("/api/v2/torrents/info", &torrents); err != nil {
+	torrents, err := q.torrentList()
+	if err != nil {
 		return nil, err
 	}
 	out := []qbTorrent{}
@@ -410,6 +419,11 @@ func (q *qbit) waitFilePriority(hash string, id, priority int, timeout, interval
 // overall operation timeout. The stall deadline counts from the check's last
 // advance (progress while checking is the check's own progress), not from the
 // start.
+//
+// Trap three is the check queue: libtorrent checks one torrent at a time, and
+// a queued check is reported as checking at 0% until its turn comes. So the
+// advance that resets the stall deadline is that of any check in qBittorrent,
+// not only ours: a queue that moves is a queue we wait in.
 func (q *qbit) waitChecked(hash string, stall, interval time.Duration) (*qbTorrent, error) {
 	if stall <= 0 {
 		return nil, errors.New("operation deadline exceeded")
@@ -420,21 +434,25 @@ func (q *qbit) waitChecked(hash string, stall, interval time.Duration) (*qbTorre
 	issued := time.Now()
 	moved := issued
 	seen := false
-	lastProgress := -1.0
+	var checks map[string]float64
 	settled := 0
 	const requiredSettled = 2 // two polls in a row without checking: surely done
 	for {
-		t, err := q.torrent(hash)
+		all, err := q.torrentList()
 		if err != nil {
 			return nil, err
 		}
+		t := findTorrent(all, hash)
+		if t == nil {
+			return nil, fmt.Errorf("%w: %q", errTorrentNotFound, hash)
+		}
 		now := time.Now()
+		if current := checkProgress(all); !maps.Equal(current, checks) {
+			checks, moved = current, now
+		}
 		switch {
 		case qbitCheckingState(t.State):
 			seen, settled = true, 0
-			if t.Progress != lastProgress {
-				lastProgress, moved = t.Progress, now
-			}
 		case !seen && now.Sub(issued) < q.stateLag:
 			// Stale state: the recheck hasn't shown up in the API yet.
 		default:
@@ -448,6 +466,26 @@ func (q *qbit) waitChecked(hash string, stall, interval time.Duration) (*qbTorre
 		}
 		time.Sleep(interval)
 	}
+}
+
+func findTorrent(torrents []qbTorrent, hash string) *qbTorrent {
+	for i := range torrents {
+		if strings.EqualFold(torrents[i].Hash, hash) {
+			return &torrents[i]
+		}
+	}
+	return nil
+}
+
+// checkProgress maps every torrent that is being checked to its progress.
+func checkProgress(torrents []qbTorrent) map[string]float64 {
+	out := map[string]float64{}
+	for i := range torrents {
+		if qbitCheckingState(torrents[i].State) {
+			out[torrents[i].Hash] = torrents[i].Progress
+		}
+	}
+	return out
 }
 
 // waitRecheck waits for a recheck started on a stopped torrent and verifies

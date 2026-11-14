@@ -1138,3 +1138,38 @@ func TestNoPlayForFilesOutsideRoot(t *testing.T) {
 		}
 	}
 }
+
+// libtorrent checks one torrent at a time; a queued check sits at 0% while
+// another one runs. The wait used to count that as a stall: with two big
+// seasons trimmed at once, the second batch failed after the operation
+// timeout and left its torrent stopped.
+func TestRecheckWaitingInQueueIsNotAStall(t *testing.T) {
+	env := newTestEnv(t)
+	first := env.fake.torrents[0]
+	second := &fakeTorrent{
+		hash: "abcdefabcdefabcdefabcdefabcdefabcdefabcd", name: "Other",
+		savePath: filepath.Join(env.root, "shows"), state: "stoppedUP",
+		files: []fakeFile{{name: filepath.Join("Other", "e01.mkv"), size: 1 << 20, priority: 1, progress: 1}},
+	}
+	env.fake.mu.Lock()
+	env.fake.torrents = append(env.fake.torrents, second)
+	env.fake.serialChecks = true
+	env.fake.recheckIn = 300 * time.Millisecond
+	env.fake.mu.Unlock()
+
+	if err := env.qb.recheck(first.hash); err != nil {
+		t.Fatal(err)
+	}
+	if err := env.qb.recheck(second.hash); err != nil {
+		t.Fatal(err)
+	}
+	// The stall limit is shorter than the first check, during which the
+	// second one does not move at all.
+	got, err := env.qb.waitChecked(second.hash, 150*time.Millisecond, 10*time.Millisecond)
+	if err != nil {
+		t.Fatalf("queued check treated as stalled: %v", err)
+	}
+	if qbitCheckingState(got.State) {
+		t.Fatalf("returned while still checking: %s", got.State)
+	}
+}

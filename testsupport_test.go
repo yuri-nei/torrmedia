@@ -44,6 +44,7 @@ type fakeTorrent struct {
 	checking       bool
 	stopAfterCheck bool
 	checkProgress  float64 // progress in the API while the check runs
+	checkActive    bool    // left the check queue (see fakeQbit.serialChecks)
 }
 
 func (t *fakeTorrent) hasTag(tag string) bool {
@@ -62,6 +63,9 @@ type fakeQbit struct {
 	calls     []string
 	failInfo  bool // /torrents/info responds with an error
 	recheckIn time.Duration
+	// serialChecks models libtorrent's check queue: one torrent is checked at
+	// a time, the others wait as "checking" at 0%.
+	serialChecks bool
 	// stateLag is how long after a recheck the API still returns the previous
 	// state: qBittorrent caches it and recomputes it once per refresh
 	// interval.
@@ -81,6 +85,17 @@ type fakeQbit struct {
 
 func newFakeQbit(t *fakeTorrent) *fakeQbit {
 	return &fakeQbit{torrents: []*fakeTorrent{t}, pieceSize: 64 << 10, recheckIn: 20 * time.Millisecond}
+}
+
+// otherCheckActive reports whether a torrent other than t is being checked
+// right now. The caller holds f.mu.
+func (f *fakeQbit) otherCheckActive(t *fakeTorrent) bool {
+	for _, other := range f.torrents {
+		if other != t && other.checkActive {
+			return true
+		}
+	}
+	return false
 }
 
 func (f *fakeQbit) snapshotCalls() []string {
@@ -255,13 +270,25 @@ func (f *fakeQbit) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				t.state = "checkingUP"
 			}
 			issued := time.Now()
+			started := issued
+			t.checkActive = !(f.serialChecks && f.otherCheckActive(t))
 			go func() {
 				for {
 					time.Sleep(time.Millisecond)
 					f.mu.Lock()
-					elapsed := time.Since(issued)
+					if time.Since(issued) >= lag {
+						t.state = "checkingUP"
+					}
+					if !t.checkActive {
+						if f.otherCheckActive(t) {
+							f.mu.Unlock()
+							continue
+						}
+						t.checkActive, started = true, time.Now()
+					}
+					elapsed := time.Since(started)
 					if elapsed >= total {
-						t.checking = false
+						t.checking, t.checkActive = false, false
 						if t.stopAfterCheck {
 							t.state = "stoppedUP"
 						} else {
@@ -269,9 +296,6 @@ func (f *fakeQbit) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 						}
 						f.mu.Unlock()
 						return
-					}
-					if elapsed >= lag {
-						t.state = "checkingUP"
 					}
 					t.checkProgress = float64(elapsed) / float64(total)
 					f.mu.Unlock()
