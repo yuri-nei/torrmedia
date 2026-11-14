@@ -210,6 +210,7 @@ func (s *server) viewedSize(rel string) int64 {
 func (s *server) markViewed(shelfRel, state string) error {
 	rel := filepath.FromSlash(shelfRel)
 	size := s.viewedSize(rel)
+	endFraction := s.playback.endFraction
 	now := time.Now().Unix()
 	return s.viewed.update(func(items map[string]viewedEntry) {
 		entry := items[rel]
@@ -220,6 +221,20 @@ func (s *server) markViewed(shelfRel, state string) error {
 		}
 		entry.State = state
 		entry.Manual = true
+		// The mark re-baselines the counters. Served and Pos carry the file's
+		// whole history, and kept as they were they undid the mark on the very
+		// next read: for a file the tracker had already marked watched, Served
+		// was past manualResetFraction at once, Manual was dropped and the
+		// state flipped back to watched, so delete_watched took an episode the
+		// user had just marked unfinished. Served restarts from zero, so only
+		// bytes played after the mark count. Pos survives only below
+		// endFraction: there it is still the resume hint of a started file and
+		// cannot make it watched on its own, while a Pos past it is exactly the
+		// old read, a seek to the end say, that the mark overrides.
+		entry.Served = 0
+		if float64(entry.Pos) >= endFraction*float64(entry.Size) {
+			entry.Pos = 0
+		}
 		entry.Updated = now
 		items[rel] = entry
 	})
@@ -406,6 +421,11 @@ func (s *server) trackPlayback(rel, item string, size, start, delta, requestTota
 		if requestTotal >= cfg.minPlayChunk {
 			entry.Pos = max(entry.Pos, start+requestTotal)
 		}
+		// A manual mark gives way only once manualResetFraction of the file
+		// has been played since it was set: markViewed and clearViewedFile
+		// restart Served, so it counts from the mark. From then on tracking is
+		// automatic again, with the thresholds below still counted from the
+		// mark.
 		if entry.Manual && float64(entry.Served) >= cfg.manualResetFraction*float64(size) {
 			entry.Manual = false
 		}
