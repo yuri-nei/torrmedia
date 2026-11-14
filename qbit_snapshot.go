@@ -1,5 +1,7 @@
 package main
 
+import "errors"
+
 // qbitSnapshot captures the torrents and their files in a single pass.
 //
 // That is N+1 requests to qBittorrent per poller tick, which costs nothing for
@@ -16,6 +18,12 @@ func (s *server) qbitSnapshot() ([]qbTorrentSnapshot, error) {
 	out := make([]qbTorrentSnapshot, 0, len(torrents))
 	for i := range torrents {
 		files, err := s.qb.files(torrents[i].Hash)
+		if errors.Is(err, errTorrentNotFound) {
+			// Removed between the two requests (an item removal, a discarded
+			// or expired draft). The next tick won't list it at all; failing
+			// here would show the whole catalog as qBittorrent being down.
+			continue
+		}
 		if err != nil {
 			return nil, err
 		}

@@ -229,9 +229,23 @@ func (q *qbit) getText(path string, out *string) error {
 }
 
 func (q *qbit) files(hash string) ([]qbFile, error) {
+	resp, err := q.doAuth("GET", "/api/v2/torrents/files?hash="+url.QueryEscape(hash), nil)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusNotFound {
+		io.Copy(io.Discard, resp.Body)
+		return nil, errTorrentNotFound
+	}
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("GET torrents/files: HTTP %d", resp.StatusCode)
+	}
 	var files []qbFile
-	err := q.getJSON("/api/v2/torrents/files?hash="+url.QueryEscape(hash), &files)
-	return files, err
+	if err := json.NewDecoder(resp.Body).Decode(&files); err != nil {
+		return nil, err
+	}
+	return files, nil
 }
 
 // filesIfKnown tells "no metadata yet" apart from a real error. Until the

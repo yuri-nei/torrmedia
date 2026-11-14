@@ -371,3 +371,31 @@ func TestRootItemStaysWholeWithoutItsTorrent(t *testing.T) {
 		t.Fatalf("during an outage: items=%v", got)
 	}
 }
+
+// A torrent removed between /torrents/info and its /torrents/files used to
+// fail the whole snapshot: for one frame every item turned unknown with no
+// actions, and mutations resolved against that catalog got a 502.
+func TestTorrentVanishingMidSnapshotIsSkipped(t *testing.T) {
+	env := newTestEnv(t)
+	env.fake.mu.Lock()
+	env.fake.torrents = append(env.fake.torrents, &fakeTorrent{
+		hash: "abcdefabcdefabcdefabcdefabcdefabcdefabcd", name: "Gone",
+		savePath: filepath.Join(env.root, "shows"), state: "uploading",
+		files: []fakeFile{{name: filepath.Join("Gone", "e01.mkv"), size: 1 << 20, priority: 1, progress: 1}},
+	})
+	env.fake.vanishing = "abcdefabcdefabcdefabcdefabcdefabcdefabcd"
+	env.fake.mu.Unlock()
+
+	cat := env.buildCatalog()
+	if !cat.qbitOK {
+		t.Fatalf("one vanished torrent made the catalog degraded: %s", cat.degraded)
+	}
+	for _, item := range cat.items {
+		if item.title == "Gone" {
+			t.Fatal("the vanished torrent is still listed")
+		}
+	}
+	if len(cat.items) == 0 || cat.items[0].status == statusUnknown {
+		t.Fatalf("the other item lost its state: %+v", cat.items)
+	}
+}

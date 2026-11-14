@@ -70,6 +70,9 @@ type fakeQbit struct {
 	// serialChecks models libtorrent's check queue: one torrent is checked at
 	// a time, the others wait as "checking" at 0%.
 	serialChecks bool
+	// vanishing names a torrent that /torrents/info still lists but whose
+	// files already answer 404, as if it were removed between the requests.
+	vanishing string
 	// stateLag is how long after a recheck the API still returns the previous
 	// state: qBittorrent caches it and recomputes it once per refresh
 	// interval.
@@ -181,7 +184,7 @@ func (f *fakeQbit) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	case "/api/v2/torrents/files":
 		t := f.find(hash)
-		if t == nil {
+		if t == nil || t.hash == f.vanishing {
 			http.NotFound(w, r)
 			return
 		}
