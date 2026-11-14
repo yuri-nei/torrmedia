@@ -184,8 +184,10 @@ type apiItemList struct {
 
 // normalizeState translates a qBittorrent state into our vocabulary.
 // qBittorrent's list of values is open-ended and changes between versions,
-// so an unknown value deliberately goes to error instead of failing the
-// parse.
+// so nothing here fails on a value it does not know: qBittorrent's own
+// "unknown" is an error, and anything else unlisted falls back to
+// downloading, which is what all the remaining download-side states
+// (allocating, metaDL, queuedDL, stalledDL, forcedDL, ...) are.
 func normalizeState(state string) string {
 	switch {
 	case state == "":

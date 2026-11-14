@@ -1,13 +1,13 @@
 #!/bin/bash
-# Deploys torrmedia to a server. Idempotent. Run: sudo bash deploy.sh
+# Deploys torrmedia to a server. Idempotent. Run: sudo bash install.sh
 #
 # It installs EXACTLY the requested version, and only if its checksum matches
 # SHA256SUMS. The script used to install an unversioned deploy/torrmedia that
 # lagged several versions behind the sources, so a fresh install got old
 # code.
 #
-#   TORRMEDIA_VERSION=2026-07-27.1 sudo -E bash deploy.sh   # explicit version
-#   sudo bash deploy.sh                              # latest in SHA256SUMS
+#   TORRMEDIA_VERSION=2026-07-27.1 sudo -E bash install.sh   # explicit version
+#   sudo bash install.sh                              # latest in SHA256SUMS
 #
 # The firewall, reverse proxy and token are the installer's responsibility,
 # see README. The script does not expose anything to the outside by itself.
