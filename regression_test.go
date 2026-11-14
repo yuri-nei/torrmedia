@@ -1389,3 +1389,120 @@ func TestShelfRemoveDoesNotFollowSwappedSymlink(t *testing.T) {
 		}
 	}
 }
+
+// The actions list and the entry check are one function, but the bodies of
+// operations have refusals of their own: a torrent being checked, a stop
+// that never shows, a piece size the trim cannot handle. An action could be
+// offered, accepted with 202 and then always fail. This walks the torrent
+// states and runs every offered action, each on a fresh copy of the same
+// state, requiring it to succeed.
+func TestEveryOfferedActionSucceeds(t *testing.T) {
+	type stateCase struct {
+		name, state, errorState string
+		partial                 bool // e01 is still downloading
+	}
+	cases := []stateCase{
+		{name: "stopped", state: "stoppedUP"},
+		{name: "seeding", state: "uploading"},
+		{name: "downloading", state: "downloading", partial: true},
+		{name: "checking", state: "checkingUP"},
+		{name: "moving", state: "moving"},
+		{name: "error", state: "uploading", errorState: "error"},
+		{name: "missingFiles", state: "stoppedUP", errorState: "missingFiles"},
+	}
+	setup := func(t *testing.T, c stateCase) (*testEnv, *catalogItem) {
+		env := newTestEnv(t)
+		env.deleteDebounce = 20 * time.Millisecond
+		env.operationTimeout = 3 * time.Second
+		env.qb.stateLag = 50 * time.Millisecond
+		env.fake.mu.Lock()
+		torrent := env.fake.torrents[0]
+		torrent.state, torrent.errorState = c.state, c.errorState
+		torrent.files[1].priority = 0 // excluded: enable is on offer
+		if c.partial {
+			torrent.files[0].progress = 0.5
+		}
+		env.fake.mu.Unlock()
+		_, item := env.firstItem(t)
+		// A watched episode puts delete_watched and clear_viewed on offer.
+		if err := env.markViewed(item.files[0].shelfRel, watchWatched); err != nil {
+			t.Fatal(err)
+		}
+		_, item = env.firstItem(t)
+		return env, item
+	}
+	type request struct{ method, path, body string }
+	itemRequest := func(item *catalogItem, action string) request {
+		base := "/items/" + item.id
+		switch action {
+		case actionStart, actionStop, actionRecheck:
+			return request{http.MethodPost, base + "/" + action, ""}
+		case actionDeleteWatched:
+			return request{http.MethodDelete, base + "/files?watched=true", ""}
+		case actionRemove:
+			return request{http.MethodDelete, base, ""}
+		case actionRemoveWithData:
+			return request{http.MethodDelete, base + "?delete_files=true", ""}
+		case actionClearViewed:
+			return request{http.MethodDelete, base + "/viewed", ""}
+		}
+		t.Fatalf("no request for item action %q", action)
+		return request{}
+	}
+	fileRequest := func(item *catalogItem, file *catalogFile, action string) request {
+		base := "/items/" + item.id + "/files/" + file.id
+		switch action {
+		case actionPlay:
+			return request{http.MethodGet, base + "/stream/" + file.name, ""}
+		case actionDelete:
+			return request{http.MethodDelete, base, ""}
+		case actionEnable:
+			return request{http.MethodPost, base + "/enable", ""}
+		case actionSetPriority:
+			return request{http.MethodPut, base + "/priority", `{"priority":"high"}`}
+		case actionSetViewed:
+			return request{http.MethodPut, base + "/viewed", `{"state":"started"}`}
+		case actionClearViewed:
+			return request{http.MethodDelete, base + "/viewed", ""}
+		}
+		t.Fatalf("no request for file action %q", action)
+		return request{}
+	}
+	run := func(t *testing.T, env *testEnv, label string, req request) {
+		rec := env.do(t, req.method, req.path, req.body)
+		switch {
+		case rec.Code == http.StatusAccepted:
+			op := env.awaitOperation(t, decodeJSON[operation](t, rec.Body.Bytes()).ID)
+			if op.State != opDone {
+				t.Fatalf("%s was offered, but its operation failed: %+v (error %v)", label, op, deref(op.Error))
+			}
+		case rec.Code >= 300:
+			t.Fatalf("%s was offered, but the request was refused: %d %s", label, rec.Code, rec.Body)
+		}
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			env, item := setup(t, c)
+			cat := env.catalog.Load()
+			for _, action := range env.itemActionList(cat, item) {
+				env, item := setup(t, c)
+				run(t, env, "item "+action, itemRequest(item, action))
+			}
+			for i := range item.files {
+				for _, action := range env.fileActionList(cat, item, &item.files[i]) {
+					env, item := setup(t, c)
+					file := &item.files[i]
+					run(t, env, file.name+" "+action, fileRequest(item, file, action))
+				}
+			}
+		})
+	}
+}
+
+func deref(s *string) string {
+	if s == nil {
+		return ""
+	}
+	return *s
+}
