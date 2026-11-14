@@ -14,6 +14,11 @@ StateDirectoryMode=0750
 ExecStart=/usr/local/bin/torrmedia
 Restart=on-failure
 RestartSec=3
+# On stop torrmedia lets running operations finish (a delete batch may be
+# in the middle of a recheck) for up to TORRMEDIA_OPERATION_TIMEOUT + 30 s.
+# The systemd default of 90 s would kill it halfway and leave the torrent
+# stopped. Raise this if you raise TORRMEDIA_OPERATION_TIMEOUT.
+TimeoutStopSec=6min
 NoNewPrivileges=true
 MemoryAccounting=true
 MemoryHigh=256M

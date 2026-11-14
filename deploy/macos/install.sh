@@ -10,6 +10,10 @@
 # Everything lives in ~/Library/Application Support/torrmedia, the log in
 # ~/Library/Logs/torrmedia.log. Firewall and network exposure are yours to
 # decide, see README.
+#
+# ExitTimeOut gives running operations (a delete batch may be in the middle
+# of a recheck) the same 6 minutes to finish on stop that the systemd unit
+# gives; launchd's default of 20 s would kill torrmedia halfway.
 set -euo pipefail
 SRC="$(cd "$(dirname "$0")" && pwd)"
 LABEL=io.github.yuri-nei.torrmedia
@@ -115,6 +119,8 @@ cat > "$PLIST" <<EOF
 	</dict>
 	<key>ThrottleInterval</key>
 	<integer>10</integer>
+	<key>ExitTimeOut</key>
+	<integer>360</integer>
 	<key>StandardOutPath</key>
 	<string>$LOG</string>
 	<key>StandardErrorPath</key>
