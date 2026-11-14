@@ -11,22 +11,25 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"mime"
 	"net/http"
+	"strings"
 )
 
 // Machine-readable error codes. The text is written for humans and may
 // change; the code is part of the contract.
 const (
-	codeBadRequest      = "bad_request"
-	codeUnauthorized    = "unauthorized"
-	codeRefused         = "refused"
-	codeNotFound        = "not_found"
-	codeAmbiguous       = "ambiguous"
-	codeBusy            = "busy"
-	codeStreaming       = "streaming"
-	codeQbitUnavailable = "qbittorrent_unavailable"
-	codeInternal        = "internal"
-	codeUnavailable     = "unavailable"
+	codeBadRequest           = "bad_request"
+	codeUnauthorized         = "unauthorized"
+	codeRefused              = "refused"
+	codeNotFound             = "not_found"
+	codeAmbiguous            = "ambiguous"
+	codeBusy                 = "busy"
+	codeStreaming            = "streaming"
+	codeQbitUnavailable      = "qbittorrent_unavailable"
+	codeInternal             = "internal"
+	codeUnavailable          = "unavailable"
+	codeUnsupportedMediaType = "unsupported_media_type"
 )
 
 type apiError struct {
@@ -49,7 +52,8 @@ func writeErr(w http.ResponseWriter, status int, code, format string, a ...any) 
 func writeNoContent(w http.ResponseWriter) { w.WriteHeader(http.StatusNoContent) }
 
 // decodeBody reads the JSON request body. An empty body is an empty object:
-// commands without parameters have no body at all.
+// commands without parameters have no body at all. wrap has already refused
+// a body that is not declared as application/json.
 func decodeBody(r *http.Request, v any) error {
 	if r.Body == nil || r.ContentLength == 0 {
 		return nil
@@ -62,8 +66,49 @@ func decodeBody(r *http.Request, v any) error {
 	return nil
 }
 
+// checkForgery refuses a state-changing request that a web page open in the
+// user's browser could have sent by itself. Such a page cannot attach the
+// token, but the token is optional and off by default.
+//
+// A cross-site fetch with a JSON body needs a CORS preflight, which this
+// server never answers, so the browser does not send it. A "simple" request
+// needs none: a text/plain or form body still goes out, and it can carry
+// JSON. So a body must be declared as application/json, as every real client
+// does; a command without a body has nothing to check.
+//
+// Sec-Fetch-Site is defence in depth. Browsers set it and other clients do
+// not, so "cross-site" means a page on another site made the request. It is
+// no substitute for the content type check: browsers only send it to
+// trustworthy origins (HTTPS, localhost), not to a plain http:// LAN address.
+func checkForgery(r *http.Request) *denial {
+	if r.Method == http.MethodGet || r.Method == http.MethodHead {
+		return nil
+	}
+	if strings.EqualFold(r.Header.Get("Sec-Fetch-Site"), "cross-site") {
+		return deny(http.StatusForbidden, codeRefused,
+			"cross-site requests are not accepted")
+	}
+	// -1 is a body of unknown length (chunked): it is still a body.
+	if r.ContentLength != 0 && !isJSONMediaType(r.Header.Get("Content-Type")) {
+		return deny(http.StatusUnsupportedMediaType, codeUnsupportedMediaType,
+			"request body must be application/json")
+	}
+	return nil
+}
+
+// isJSONMediaType accepts application/json with any parameters (charset);
+// mime.ParseMediaType lower-cases the type and rejects malformed values.
+func isJSONMediaType(value string) bool {
+	mediaType, _, err := mime.ParseMediaType(value)
+	return err == nil && mediaType == "application/json"
+}
+
 func (s *server) wrap(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if d := checkForgery(r); d != nil {
+			writeDenial(w, d)
+			return
+		}
 		if s.token != "" && r.URL.Path != "/health" {
 			// Constant-time comparison: a plain != returns at the first
 			// mismatching byte and makes the token guessable by timing.
