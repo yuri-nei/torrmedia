@@ -30,7 +30,7 @@ const defaultDeleteDebounce = 15 * time.Second
 
 type server struct {
 	root   string        // absolute, symlink-resolved, no trailing slash
-	osRoot *os.Root      // all file operations go through it: no symlink can escape
+	osRoot *os.Root      // streams, trims and deletes go through it: no symlink can lead them out
 	token  string        // TORRMEDIA_TOKEN: if set, Authorization: Bearer is required
 	hosts  hostAllowlist // TORRMEDIA_HOSTS: names served besides IPs, localhost and *.local
 	qb     *qbit         // nil if QBIT_URL is empty

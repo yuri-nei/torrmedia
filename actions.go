@@ -315,23 +315,30 @@ func (s *server) reserveDeleteFile(file *catalogFile) (release func(), free bool
 
 // removeShelfFile deletes a catalog file that has no torrent behind it.
 func (s *server) removeShelfFile(file *catalogFile) error {
-	abs, ok := s.fileAbs(file)
-	if !ok {
+	if file.shelfRel == "" {
 		return errors.New("file lies outside the media root")
 	}
-	info, err := os.Stat(abs)
+	root := s.fsRoot()
+	if root == nil {
+		return errors.New("media root is not available")
+	}
+	rel := filepath.FromSlash(file.shelfRel)
+	info, err := root.Lstat(rel)
 	if err != nil {
 		return err
+	}
+	if !info.Mode().IsRegular() {
+		return errors.New("not a regular file")
 	}
 	unreserve, free := s.streamReg().reserve(inodeKey(info))
 	if !free {
 		return errors.New("file is being streamed right now")
 	}
 	defer unreserve()
-	if err := os.Remove(abs); err != nil {
+	if err := root.Remove(rel); err != nil {
 		return err
 	}
-	s.pruneEmptyDirs(filepath.Dir(abs))
+	s.pruneEmptyDirs(filepath.Dir(rel))
 	return nil
 }
 

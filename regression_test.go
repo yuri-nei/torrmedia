@@ -1356,3 +1356,36 @@ func TestShelfRemoveWarningsHaveNoAbsolutePaths(t *testing.T) {
 		}
 	}
 }
+
+// Removing an item without a torrent deleted its files by absolute path. If
+// the item's folder was swapped for a symlink between listing and removal,
+// the delete followed it and removed files outside the media root.
+func TestShelfRemoveDoesNotFollowSwappedSymlink(t *testing.T) {
+	env := newTestEnv(t)
+	env.fake.mu.Lock()
+	env.fake.torrents = nil
+	env.fake.mu.Unlock()
+	_, item := env.firstItem(t)
+
+	outside := t.TempDir()
+	for _, name := range []string{"e01.mkv", "e02.mkv"} {
+		writeTestFile(t, filepath.Join(outside, name), 1<<20)
+	}
+	dir := filepath.Join(env.root, "shows", "Release")
+	if err := os.RemoveAll(dir); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outside, dir); err != nil {
+		t.Fatal(err)
+	}
+
+	rec := env.do(t, http.MethodDelete, "/items/"+item.id+"?delete_files=true", "")
+	if rec.Code == http.StatusAccepted {
+		env.awaitOperation(t, decodeJSON[operation](t, rec.Body.Bytes()).ID)
+	}
+	for _, name := range []string{"e01.mkv", "e02.mkv"} {
+		if _, err := os.Stat(filepath.Join(outside, name)); err != nil {
+			t.Fatalf("a file outside the media root was deleted: %v", err)
+		}
+	}
+}

@@ -63,11 +63,16 @@ func (s *server) openInRoot(rel string) (*os.File, error) {
 	return root.Open(clean)
 }
 
-// pruneEmptyDirs removes directories left empty, walking up from dir,
-// without touching root or the top-level category directories.
+// pruneEmptyDirs removes directories left empty, walking up from dir
+// (relative to the media root), without touching the root or the top-level
+// category directories.
 func (s *server) pruneEmptyDirs(dir string) {
-	for strings.HasPrefix(dir, s.root+"/") && filepath.Dir(dir) != s.root {
-		if err := os.Remove(dir); err != nil {
+	root := s.fsRoot()
+	if root == nil {
+		return
+	}
+	for dir != "." && filepath.Dir(dir) != "." {
+		if err := root.Remove(dir); err != nil {
 			return
 		}
 		dir = filepath.Dir(dir)
