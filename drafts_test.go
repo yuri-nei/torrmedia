@@ -12,10 +12,12 @@ import (
 	"encoding/base32"
 	"encoding/hex"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -521,5 +523,234 @@ func TestDraftFilesFollowCatalogOrder(t *testing.T) {
 	}
 	if strings.Join(after, " ") != strings.Join(ids, " ") {
 		t.Fatalf("item order %v differs from draft order %v", after, ids)
+	}
+}
+
+// --- concurrent lifecycle ---
+//
+// A draft is touched by several parties at once: the resolver, the confirm
+// and delete handlers, the sweeper. The tests below hold one of them at a
+// known point and let another one in, instead of hoping that timing will
+// line them up.
+
+// qbitGate stands between the server and the fake qBittorrent and holds the
+// requests it matches until the test opens it.
+type qbitGate struct {
+	reached chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func (g *qbitGate) open() { g.once.Do(func() { close(g.release) }) }
+
+// await waits until a held request has reached the gate.
+func (g *qbitGate) await(t *testing.T) {
+	t.Helper()
+	select {
+	case <-g.reached:
+	case <-time.After(5 * time.Second):
+		t.Fatal("no request reached the qbittorrent gate")
+	}
+}
+
+// gateQbit routes the server's qBittorrent calls through a gate holding the
+// requests match picks.
+func (e *testEnv) gateQbit(t *testing.T, match func(*http.Request) bool) *qbitGate {
+	t.Helper()
+	g := &qbitGate{reached: make(chan struct{}, 1), release: make(chan struct{})}
+	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if match(r) {
+			select {
+			case g.reached <- struct{}{}:
+			default:
+			}
+			<-g.release
+		}
+		e.fake.ServeHTTP(w, r)
+	}))
+	t.Cleanup(proxy.Close)
+	t.Cleanup(g.open) // runs first: Close waits for the requests still held
+	qb, err := newQbit(proxy.URL, "user", "pass")
+	if err != nil {
+		t.Fatal(err)
+	}
+	qb.stateLag = e.qb.stateLag
+	e.qb = qb
+	return g
+}
+
+func qbitPath(path string) func(*http.Request) bool {
+	return func(r *http.Request) bool { return r.URL.Path == path }
+}
+
+// heldBody is a request body whose first read waits for the test: a handler
+// that looks the draft up before decoding its body stops right between the
+// two.
+type heldBody struct {
+	data    io.Reader
+	reached chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func newHeldBody(data string) *heldBody {
+	return &heldBody{data: strings.NewReader(data), reached: make(chan struct{}), release: make(chan struct{})}
+}
+
+func (b *heldBody) Read(p []byte) (int, error) {
+	b.once.Do(func() {
+		close(b.reached)
+		<-b.release
+	})
+	return b.data.Read(p)
+}
+
+func (e *testEnv) hasCall(match func(string) bool) bool {
+	for _, call := range e.fake.snapshotCalls() {
+		if match(call) {
+			return true
+		}
+	}
+	return false
+}
+
+func isDeleteCall(call string) bool { return strings.HasPrefix(call, "delete:") }
+
+// A confirm in flight owns its draft. The sweeper used to expire a draft by
+// its age alone: past the TTL it deleted a confirming draft's torrent with its
+// data right before the confirm removed the draft tags, or overwrote a
+// finished confirm with "draft expired" while the item was downloading.
+func TestSweepSparesDraftBeingConfirmed(t *testing.T) {
+	env := draftEnv(t)
+	gate := env.gateQbit(t, qbitPath("/api/v2/torrents/removeTags"))
+	created := env.createDraft(t, `{"magnet":"`+draftMagnet+`"}`)
+	ready := env.awaitDraft(t, created.ID, draftReady)
+
+	body := `{"files":["` + ready.Files[1].ID + `"]}`
+	if rec := env.do(t, "POST", "/drafts/"+created.ID+"/confirm", body); rec.Code != http.StatusAccepted {
+		t.Fatalf("confirm = %d %s", rec.Code, rec.Body.String())
+	}
+	gate.await(t) // the confirm is about to turn the draft into an item
+
+	env.draftTTL = time.Nanosecond
+	env.sweepDrafts()
+	if rec := env.do(t, "DELETE", "/drafts/"+created.ID, ""); rec.Code != http.StatusConflict {
+		t.Fatalf("DELETE of a confirming draft = %d %s", rec.Code, rec.Body.String())
+	}
+	if d, _ := env.draftStore().get(created.ID); d.status != draftConfirming {
+		t.Fatalf("confirming draft was taken over: %q %q", d.status, d.failure)
+	}
+	if env.hasCall(isDeleteCall) {
+		t.Fatalf("torrent of a confirming draft was deleted: %v", env.fake.snapshotCalls())
+	}
+
+	gate.open()
+	if d := env.awaitDraft(t, created.ID, draftConfirmed, draftFailed); d.Status != draftConfirmed {
+		t.Fatalf("confirm failed: %v", d.Error)
+	}
+	env.sweepDrafts()
+	env.inflight.Wait()
+	if d := env.awaitDraft(t, created.ID, draftConfirmed, draftFailed); d.Status != draftConfirmed || d.Error != nil {
+		t.Fatalf("confirmed draft was rewritten by the sweep: %+v", d)
+	}
+	env.fake.mu.Lock()
+	torrent := env.fake.find(env.fake.addHash)
+	env.fake.mu.Unlock()
+	if torrent == nil || env.hasCall(isDeleteCall) {
+		t.Fatalf("confirmed item was deleted: %v", env.fake.snapshotCalls())
+	}
+}
+
+// A confirm that read the draft as ready must not go ahead once a DELETE has
+// taken the draft over. Both used to pass their status checks and then both
+// act: the confirm went on with a torrent that was being deleted with its
+// data.
+func TestDraftConfirmLosesToConcurrentDelete(t *testing.T) {
+	env := draftEnv(t)
+	created := env.createDraft(t, `{"magnet":"`+draftMagnet+`"}`)
+	ready := env.awaitDraft(t, created.ID, draftReady)
+
+	body := newHeldBody(`{"files":["` + ready.Files[0].ID + `"],"category":"Shows"}`)
+	req := httptest.NewRequest("POST", "/drafts/"+created.ID+"/confirm", body)
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	served := make(chan struct{})
+	go func() {
+		defer close(served)
+		env.routes().ServeHTTP(rec, req)
+	}()
+	select {
+	case <-body.reached: // the handler has seen the draft ready and reads the body
+	case <-time.After(5 * time.Second):
+		t.Fatal("confirm handler did not read its body")
+	}
+
+	if del := env.do(t, "DELETE", "/drafts/"+created.ID, ""); del.Code != http.StatusAccepted {
+		t.Fatalf("DELETE = %d %s", del.Code, del.Body.String())
+	}
+	close(body.release)
+	<-served
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("confirm after a concurrent DELETE = %d %s", rec.Code, rec.Body.String())
+	}
+
+	env.inflight.Wait()
+	if d, _ := env.draftStore().get(created.ID); d.status != draftDiscarded {
+		t.Fatalf("draft is %q (%s), want discarded", d.status, d.failure)
+	}
+	confirmCall := func(call string) bool {
+		return strings.HasPrefix(call, "prio") || strings.HasPrefix(call, "setCategory:") ||
+			strings.HasPrefix(call, "removeTags:") || call == "start"
+	}
+	if env.hasCall(confirmCall) {
+		t.Fatalf("a confirm ran on a discarded draft: %v", env.fake.snapshotCalls())
+	}
+}
+
+// A DELETE while the magnet is still being added finds no hash to remove. The
+// resolver used to carry on regardless: it marked the discarded draft ready
+// again and left the torrent in qBittorrent. Now it sees that the draft was
+// taken over and removes the torrent itself.
+func TestDraftDiscardedWhileResolvingRemovesTorrent(t *testing.T) {
+	env := draftEnv(t)
+	gate := env.gateQbit(t, qbitPath("/api/v2/torrents/add"))
+	created := env.createDraft(t, `{"magnet":"`+draftMagnet+`"}`)
+	gate.await(t)
+
+	if del := env.do(t, "DELETE", "/drafts/"+created.ID, ""); del.Code != http.StatusAccepted {
+		t.Fatalf("DELETE = %d %s", del.Code, del.Body.String())
+	}
+	env.awaitDraft(t, created.ID, draftDiscarded)
+	gate.open()
+	env.inflight.Wait()
+
+	if d, _ := env.draftStore().get(created.ID); d.status != draftDiscarded {
+		t.Fatalf("discarded draft came back as %q", d.status)
+	}
+	env.fake.mu.Lock()
+	torrent := env.fake.find(env.fake.addHash)
+	env.fake.mu.Unlock()
+	if torrent != nil {
+		t.Fatal("torrent of a discarded draft was left in qbittorrent")
+	}
+}
+
+// A draft nobody acts on is still expired: claimed first, then removed with
+// its data.
+func TestSweepExpiresOpenDraft(t *testing.T) {
+	env := draftEnv(t)
+	created := env.createDraft(t, `{"magnet":"`+draftMagnet+`"}`)
+	env.awaitDraft(t, created.ID, draftReady)
+	env.inflight.Wait()
+
+	env.draftTTL = time.Nanosecond
+	env.sweepDrafts()
+
+	d, _ := env.draftStore().get(created.ID)
+	if d.status != draftFailed || d.failure != "draft expired" {
+		t.Fatalf("expired draft is %q (%s)", d.status, d.failure)
+	}
+	if !env.hasCall(func(call string) bool { return call == "delete:deleteFiles=true" }) {
+		t.Fatalf("expired draft's data was left behind: %v", env.fake.snapshotCalls())
 	}
 }
