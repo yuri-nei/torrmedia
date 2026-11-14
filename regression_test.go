@@ -1242,3 +1242,34 @@ func TestDeleteFromErroredTorrent(t *testing.T) {
 		})
 	}
 }
+
+// Removing an item with no torrent deletes its files one by one. When none
+// of them could be deleted, the operation still reported done and the client
+// showed the item as removed.
+func TestShelfRemoveFailsWhenNothingWasDeleted(t *testing.T) {
+	env := newTestEnv(t)
+	env.fake.mu.Lock()
+	env.fake.torrents = nil
+	env.fake.mu.Unlock()
+	_, item := env.firstItem(t)
+	if item.torrentBacked() {
+		t.Fatal("expected a shelf item")
+	}
+	dir := filepath.Join(env.root, "shows", "Release")
+	if err := os.Chmod(dir, 0o555); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.Chmod(dir, 0o755) })
+
+	rec := env.do(t, http.MethodDelete, "/items/"+item.id+"?delete_files=true", "")
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("remove: status=%d body=%s", rec.Code, rec.Body)
+	}
+	op := env.awaitOperation(t, decodeJSON[operation](t, rec.Body.Bytes()).ID)
+	if op.State != opFailed {
+		t.Fatalf("nothing was deleted, yet the operation is %s: %+v", op.State, op)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "e01.mkv")); err != nil {
+		t.Fatalf("file should still be there: %v", err)
+	}
+}

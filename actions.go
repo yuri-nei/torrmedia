@@ -147,6 +147,12 @@ func (s *server) runItemRemove(op *operation, item *catalogItem, deleteFiles boo
 		removed++
 	}
 	s.poke()
+	// Not a single file went away: that is a failure, not a success with
+	// warnings, or the client would report the item as removed while it is
+	// still there.
+	if removed == 0 && len(warnings) > 0 {
+		return nil, warnings, fmt.Errorf("no file was deleted: %s", warnings[0])
+	}
 	return map[string]any{"files_deleted": removed}, warnings, nil
 }
 
