@@ -109,6 +109,11 @@ func (s *server) permitFile(cat *catalog, item *catalogItem, file *catalogFile, 
 		if file.status != fileReady {
 			return deny(http.StatusConflict, codeNotFound, "file is not fully downloaded")
 		}
+		// qBittorrent may report a file of a torrent saved outside the media
+		// root as complete, but there is nothing we could stream.
+		if file.shelfRel == "" {
+			return deny(http.StatusConflict, codeNotFound, "file lies outside the media root")
+		}
 		// A file that a running operation is deleting may be zeroed at any
 		// moment: offering it would promise something that breaks off midway.
 		// The operation does not touch the item's other files (not the stop,
@@ -152,6 +157,20 @@ func (s *server) permitFile(cat *catalog, item *catalogItem, file *catalogFile, 
 	}
 	if action != actionDelete && busy {
 		return deny(http.StatusConflict, codeBusy, "an operation is already running for this item")
+	}
+	// A delete does queue up behind other operations, but not behind removing
+	// the item: by the time the batch runs, the torrent is gone.
+	if action == actionDelete && s.operations.runningKind(item.id, opItemRemove, opItemRemoveWithData) {
+		return deny(http.StatusConflict, codeBusy, "the item is being removed")
+	}
+	// A check that qBittorrent runs on its own (started from its Web UI, after
+	// a restart, or while it moves files) makes delete and enable fail: both
+	// refuse to touch a torrent that is being checked. While one of our own
+	// operations runs, the check is ours, and delete and enable queue up
+	// behind it instead.
+	if (action == actionDelete || action == actionEnable) &&
+		item.status == statusChecking && !s.operations.busy(item.id) {
+		return deny(http.StatusConflict, codeBusy, "item is being checked")
 	}
 	if file.ambiguous {
 		return deny(http.StatusConflict, codeAmbiguous,

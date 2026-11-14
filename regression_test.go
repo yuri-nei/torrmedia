@@ -1034,3 +1034,107 @@ func TestMagnetWithLineBreakIsRejected(t *testing.T) {
 		}
 	}
 }
+
+// fileActionsNow rebuilds the catalog from the fake and returns the actions
+// offered for every file of the first item, by file name.
+func (e *testEnv) fileActionsNow(t *testing.T) map[string][]string {
+	t.Helper()
+	cat := e.buildCatalog()
+	e.catalog.Store(cat)
+	if len(cat.items) == 0 {
+		t.Fatal("catalog is empty")
+	}
+	item := cat.items[0]
+	out := map[string][]string{}
+	for i := range item.files {
+		out[item.files[i].name] = e.fileActionList(cat, item, &item.files[i])
+	}
+	return out
+}
+
+// A check that qBittorrent runs on its own used to leave delete and enable
+// on offer, and both operations then always failed with "being checked".
+func TestExternalCheckHidesDeleteAndEnable(t *testing.T) {
+	env := newTestEnv(t)
+	env.fake.mu.Lock()
+	env.fake.torrents[0].files[1].priority = 0
+	env.fake.mu.Unlock()
+	setState := func(state string) {
+		env.fake.mu.Lock()
+		env.fake.torrents[0].state = state
+		env.fake.mu.Unlock()
+	}
+	for _, state := range []string{"checkingUP", "checkingResumeData", "moving"} {
+		setState(state)
+		actions := env.fileActionsNow(t)
+		if contains(actions["e01.mkv"], actionDelete) || contains(actions["e02.mkv"], actionEnable) {
+			t.Fatalf("%s: delete/enable offered during qBittorrent's own check: %v", state, actions)
+		}
+	}
+	setState("stoppedUP")
+	actions := env.fileActionsNow(t)
+	if !contains(actions["e01.mkv"], actionDelete) || !contains(actions["e02.mkv"], actionEnable) {
+		t.Fatalf("delete/enable did not come back after the check: %v", actions)
+	}
+}
+
+// While one of our own operations runs, the check is ours and a delete
+// queues behind it, so it stays on offer: that is how episodes get batched.
+func TestDeleteStaysOfferedDuringOwnRecheck(t *testing.T) {
+	env := newTestEnv(t)
+	_, item := env.firstItem(t)
+	op := env.ops().start(opFileDelete, item.id, &item.files[1].id, item.files[1].id)
+	defer env.ops().succeed(op.ID, nil, nil)
+	env.fake.mu.Lock()
+	env.fake.torrents[0].state = "checkingUP"
+	env.fake.mu.Unlock()
+	if actions := env.fileActionsNow(t); !contains(actions["e01.mkv"], actionDelete) {
+		t.Fatalf("delete is not offered while our own batch rechecks: %v", actions)
+	}
+}
+
+// A delete queued during the removal of the item could only fail: by the
+// time the batch ran, the torrent was gone.
+func TestDeleteNotOfferedWhileItemIsRemoved(t *testing.T) {
+	for _, kind := range []string{opItemRemove, opItemRemoveWithData} {
+		env := newTestEnv(t)
+		_, item := env.firstItem(t)
+		op := env.ops().start(kind, item.id, nil)
+		if actions := env.fileActionsNow(t); contains(actions["e01.mkv"], actionDelete) {
+			t.Fatalf("%s: delete offered while the item is being removed: %v", kind, actions)
+		}
+		env.ops().succeed(op.ID, nil, nil)
+		if actions := env.fileActionsNow(t); !contains(actions["e01.mkv"], actionDelete) {
+			t.Fatalf("%s: delete did not come back: %v", kind, actions)
+		}
+	}
+}
+
+// A torrent saved outside the media root can be complete in qBittorrent, but
+// there is nothing to stream: play used to be offered and the stream gave 404.
+func TestNoPlayForFilesOutsideRoot(t *testing.T) {
+	env := newTestEnv(t)
+	outside := t.TempDir()
+	for _, name := range []string{"e01.mkv", "e02.mkv"} {
+		path := filepath.Join(outside, "Release", name)
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, make([]byte, 1<<20), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	env.fake.mu.Lock()
+	env.fake.torrents[0].savePath = outside
+	env.fake.mu.Unlock()
+	cat := env.buildCatalog()
+	env.catalog.Store(cat)
+	for _, item := range cat.items {
+		for i := range item.files {
+			f := &item.files[i]
+			if f.shelfRel == "" && contains(env.fileActionList(cat, item, f), actionPlay) {
+				t.Fatalf("play offered for %q outside the root", f.name)
+			}
+		}
+	}
+}

@@ -47,9 +47,11 @@ type operation struct {
 
 // Operation kinds referenced by the rules (enableQueuesBehind)
 const (
-	opFileDelete        = "file.delete"
-	opItemDeleteWatched = "item." + actionDeleteWatched
-	opFileEnable        = "file.enable"
+	opFileDelete         = "file.delete"
+	opItemDeleteWatched  = "item." + actionDeleteWatched
+	opFileEnable         = "file.enable"
+	opItemRemove         = "item." + actionRemove
+	opItemRemoveWithData = "item." + actionRemoveWithData
 )
 
 // operations stores the operations and knows whether an item is busy.
@@ -229,6 +231,22 @@ func (o *operations) busy(itemID string) bool {
 	o.mu.Lock()
 	defer o.mu.Unlock()
 	return o.active[itemID] > 0
+}
+
+// runningKind reports whether the item has an unfinished operation of one of
+// the given kinds.
+func (o *operations) runningKind(itemID string, kinds ...string) bool {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if o.active[itemID] == 0 {
+		return false
+	}
+	for _, op := range o.byID {
+		if op.Item == itemID && !op.finished() && slices.Contains(kinds, op.Kind) {
+			return true
+		}
+	}
+	return false
 }
 
 // busyBeyond reports whether the item has an unfinished operation whose kind
