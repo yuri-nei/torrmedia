@@ -1015,3 +1015,22 @@ func TestPriorityNames(t *testing.T) {
 		}
 	}
 }
+
+// qBittorrent splits the "urls" field of torrents/add by line breaks, so a
+// magnet with a newline inside used to smuggle an arbitrary http(s) URL past
+// the magnet-only check and make qBittorrent fetch it.
+func TestMagnetWithLineBreakIsRejected(t *testing.T) {
+	env := draftEnv(t)
+	smuggled := `"magnet:?xt=urn:btih:abcdef0123456789abcdef0123456789abcdef01\nhttp://169.254.169.254/x.torrent"`
+	for _, path := range []string{"/items", "/drafts"} {
+		rec := env.do(t, http.MethodPost, path, `{"magnet":`+smuggled+`}`)
+		if rec.Code != http.StatusForbidden {
+			t.Fatalf("POST %s: status=%d, want 403 (%s)", path, rec.Code, rec.Body)
+		}
+	}
+	for _, call := range env.fake.snapshotCalls() {
+		if strings.HasPrefix(call, "add:") {
+			t.Fatalf("qBittorrent was asked to add something: %v", env.fake.snapshotCalls())
+		}
+	}
+}

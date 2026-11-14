@@ -516,6 +516,12 @@ func (s *server) runAddMagnet(op *operation, magnet, category string) (map[strin
 }
 
 func checkAddLink(link string) error {
+	// qBittorrent's "urls" field is a list separated by line breaks: a magnet
+	// with a newline inside would smuggle a second, arbitrary http(s) URL past
+	// the prefix check below. A real magnet never contains control characters.
+	if strings.ContainsFunc(link, func(r rune) bool { return r < 0x20 || r == 0x7f }) {
+		return errors.New("magnet link must not contain line breaks or control characters")
+	}
 	lower := strings.ToLower(strings.TrimSpace(link))
 	if strings.HasPrefix(lower, "magnet:?") {
 		return nil
