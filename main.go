@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"errors"
+	"flag"
 	"log"
 	"net/http"
 	"os"
@@ -15,7 +16,7 @@ import (
 	"time"
 )
 
-const version = "2026-11-15.1"
+const version = "2026-11-15.2"
 
 const defaultDeleteDebounce = 15 * time.Second
 
@@ -168,6 +169,14 @@ func envDuration(key string, target *time.Duration) {
 }
 
 func main() {
+	configPath := flag.String("config", "", "load KEY=VALUE settings from `file`; variables already in the environment win")
+	flag.Parse()
+	if *configPath != "" {
+		if err := loadEnvFile(*configPath); err != nil {
+			log.Fatalf("config: %v", err)
+		}
+	}
+
 	root, err := filepath.EvalSymlinks(envOr("TORRMEDIA_ROOT", "/var/media/library"))
 	if err != nil {
 		log.Fatalf("TORRMEDIA_ROOT: %v", err)
@@ -192,7 +201,11 @@ func main() {
 		totalBytes:        totalFilesystemBytes,
 		playback:          defaultPlaybackConfig(),
 	}
-	s.viewed, err = newViewedStore(envOr("TORRMEDIA_VIEWED_FILE", "/var/lib/torrmedia/viewed.json"))
+	viewedPath := envOr("TORRMEDIA_VIEWED_FILE", defaultViewedFile())
+	if err := os.MkdirAll(filepath.Dir(viewedPath), 0o700); err != nil {
+		log.Fatalf("TORRMEDIA_VIEWED_FILE: %v", err)
+	}
+	s.viewed, err = newViewedStore(viewedPath)
 	if err != nil {
 		log.Fatalf("TORRMEDIA_VIEWED_FILE: %v", err)
 	}

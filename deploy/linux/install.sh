@@ -4,7 +4,7 @@ SRC="$(cd "$(dirname "$0")" && pwd)"
 
 echo "== 0. pick the artifact =="
 if [ ! -f "$SRC/SHA256SUMS" ]; then
-  echo "SHA256SUMS not found next to deploy.sh, nothing to verify" >&2
+  echo "SHA256SUMS not found next to install.sh, nothing to verify" >&2
   exit 1
 fi
 if [ -z "${TORRMEDIA_VERSION:-}" ]; then
