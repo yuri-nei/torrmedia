@@ -223,6 +223,16 @@ func (h *eventHub) publishState(topic string, data []byte) {
 	}
 }
 
+// dropState forgets a topic's last snapshot once what it describes is gone.
+// Item topics lose theirs on the last unsubscribe; drafts are published with
+// or without subscribers, so drafts.go drops a draft's topic when it forgets
+// the draft.
+func (h *eventHub) dropState(topic string) {
+	h.mu.Lock()
+	delete(h.last, topic)
+	h.mu.Unlock()
+}
+
 func (h *eventHub) publishOperationFrame(topic string, data []byte) {
 	h.forEach(topic, func(sub *eventSub) { sub.pushOperation(data) })
 }

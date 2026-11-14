@@ -18,6 +18,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -784,6 +785,78 @@ func TestDraftDiscardedWhileResolvingRemovesTorrent(t *testing.T) {
 	env.fake.mu.Unlock()
 	if torrent != nil {
 		t.Fatal("torrent of a discarded draft was left in qbittorrent")
+	}
+}
+
+// Looking up the created item takes a catalog build. It used to run inside the
+// drafts mutex, and every draft endpoint and the sweep waited for it.
+func TestDraftConfirmFindsItemOutsideDraftsLock(t *testing.T) {
+	env := draftEnv(t)
+	var armed atomic.Bool
+	gate := env.gateQbit(t, func(r *http.Request) bool {
+		// The catalog lists all torrents; the confirm's own calls name one.
+		return armed.Load() && r.URL.Path == "/api/v2/torrents/info" && r.URL.RawQuery == ""
+	})
+	created := env.createDraft(t, `{"magnet":"`+draftMagnet+`"}`)
+	ready := env.awaitDraft(t, created.ID, draftReady)
+	env.inflight.Wait()
+	armed.Store(true)
+
+	body := `{"files":["` + ready.Files[0].ID + `"]}`
+	if rec := env.do(t, "POST", "/drafts/"+created.ID+"/confirm", body); rec.Code != http.StatusAccepted {
+		t.Fatalf("confirm = %d %s", rec.Code, rec.Body.String())
+	}
+	gate.await(t) // the confirm is building the catalog to find the item
+
+	got := make(chan *draft, 1)
+	go func() {
+		d, _ := env.draftStore().get(created.ID)
+		got <- d
+	}()
+	select {
+	case d := <-got:
+		if d.status != draftConfirming {
+			t.Fatalf("draft is %q while the item is looked up", d.status)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the drafts store is locked while the confirm looks up the item")
+	}
+
+	gate.open()
+	confirmed := env.awaitDraft(t, created.ID, draftConfirmed, draftFailed)
+	env.inflight.Wait()
+	if confirmed.Status != draftConfirmed || confirmed.Item == nil || *confirmed.Item == "" {
+		t.Fatalf("confirm=%+v", confirmed)
+	}
+}
+
+// The hub keeps a draft's last snapshot even with nobody subscribed: that is
+// what a client connecting to the stream gets first. Once the sweep forgets
+// the draft, the snapshot goes too; it used to stay for good.
+func TestSweepForgetsDraftSnapshot(t *testing.T) {
+	env := draftEnv(t)
+	created := env.createDraft(t, `{"magnet":"`+draftMagnet+`"}`)
+	env.awaitDraft(t, created.ID, draftReady)
+	if rec := env.do(t, "DELETE", "/drafts/"+created.ID, ""); rec.Code != http.StatusAccepted {
+		t.Fatalf("DELETE = %d %s", rec.Code, rec.Body.String())
+	}
+	env.awaitDraft(t, created.ID, draftDiscarded)
+	env.inflight.Wait()
+	if _, ok := env.hub().snapshotFor(created.ID); !ok {
+		t.Fatal("no snapshot is kept for the draft")
+	}
+
+	store := env.draftStore()
+	store.mu.Lock()
+	store.m[created.ID].settled = time.Now().Add(-time.Hour)
+	store.mu.Unlock()
+	env.sweepDrafts()
+
+	if _, ok := store.get(created.ID); ok {
+		t.Fatal("finished draft was not forgotten")
+	}
+	if _, ok := env.hub().snapshotFor(created.ID); ok {
+		t.Fatal("the hub still keeps the snapshot of a forgotten draft")
 	}
 }
 

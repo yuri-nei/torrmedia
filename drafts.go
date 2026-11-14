@@ -502,10 +502,13 @@ func (s *server) confirmDraft(id string, wanted map[string]bool, category *strin
 			return
 		}
 	}
+	// The item is looked up before taking the drafts mutex: that takes a
+	// catalog build, and every draft endpoint and the sweep wait on the mutex.
+	item := s.itemIDForHash(current.hash)
 	s.transitionDraft(id, []string{draftConfirming}, func(d *draft) {
 		d.status = draftConfirmed
 		d.category = target
-		d.item = s.itemIDForHash(current.hash)
+		d.item = item
 		for i := range d.files {
 			d.files[i].wanted = wanted[d.files[i].id]
 		}
@@ -582,7 +585,7 @@ func (s *server) sweepDrafts() {
 		switch {
 		case d.finished():
 			if now.Sub(d.settled) > 5*time.Minute {
-				s.draftStore().forget(d.id)
+				s.forgetDraft(d.id)
 			}
 		case now.Sub(d.created) > s.draftTTL:
 			s.expireDraft(d.id)
@@ -616,6 +619,14 @@ func (s *server) sweepDrafts() {
 			log.Printf("draft sweep: %v", err)
 		}
 	}
+}
+
+// forgetDraft drops a finished draft together with the snapshot the hub keeps
+// for its stream. A draft is published whether or not anyone listens, so the
+// hub would otherwise keep one snapshot for every draft ever made.
+func (s *server) forgetDraft(id string) {
+	s.draftStore().forget(id)
+	s.hub().dropState(id)
 }
 
 // expireDraft removes a draft that outlived its TTL, together with its
