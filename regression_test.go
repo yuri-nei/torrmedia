@@ -1,5 +1,9 @@
 package main
 
+// regression_test.go holds tests for scenarios that once already led to data
+// loss or to the UI lying. The contract has been rewritten twice since then,
+// but these checks describe BEHAVIOUR, so they move along with it.
+
 import (
 	"bytes"
 	"net/http"
@@ -12,8 +16,12 @@ import (
 	"time"
 )
 
+// The invariant permissions.go exists for: the list of actions sent to the
+// client and the check at request entry are one function. The client cannot
+// show a button the server would refuse to execute, and vice versa.
 func TestAdvertisedActionsMatchEnforcement(t *testing.T) {
 	env := newTestEnv(t)
+	// Vary the states: one file is excluded, the other is ready.
 	env.fake.mu.Lock()
 	env.fake.torrents[0].files[1].priority = 0
 	env.fake.mu.Unlock()
@@ -49,6 +57,9 @@ func TestAdvertisedActionsMatchEnforcement(t *testing.T) {
 	}
 }
 
+// Deleting an episode of a live torrent frees space while keeping the
+// boundary pieces shared with neighbours, and does not touch the neighbouring
+// file.
 func TestDeleteFileFreesSpaceAndKeepsNeighbour(t *testing.T) {
 	env := newTestEnv(t)
 	_, item := env.firstItem(t)
@@ -79,6 +90,8 @@ func TestDeleteFileFreesSpaceAndKeepsNeighbour(t *testing.T) {
 	}
 }
 
+// While an operation is running there is no way to start a second one, and
+// this is visible in actions, not only in the response to a request.
 func TestBusyItemOffersNoActions(t *testing.T) {
 	env := newTestEnv(t)
 	_, item := env.firstItem(t)
@@ -101,6 +114,8 @@ func TestBusyItemOffersNoActions(t *testing.T) {
 	close(release)
 }
 
+// A file the player is reading right now must not be zeroed: otherwise the
+// player gets zeros under a Content-Length it has already been sent.
 func TestActiveStreamBlocksDelete(t *testing.T) {
 	env := newTestEnv(t)
 	_, item := env.firstItem(t)
@@ -119,6 +134,7 @@ func TestActiveStreamBlocksDelete(t *testing.T) {
 	}
 	defer release()
 
+	// Removing the item together with its data must be refused at once.
 	rec := env.do(t, http.MethodDelete, "/items/"+item.id+"?delete_files=true", "")
 	if rec.Code != http.StatusConflict {
 		t.Fatalf("remove status=%d body=%s, want 409", rec.Code, rec.Body)
@@ -127,6 +143,9 @@ func TestActiveStreamBlocksDelete(t *testing.T) {
 		t.Fatalf("body=%s", rec.Body)
 	}
 
+	// Deleting the episode itself is also refused synchronously: the inode is
+	// reserved before the operation is created, so an operation that is
+	// doomed from the start is never launched.
 	rec = env.do(t, http.MethodDelete, "/items/"+item.id+"/files/"+item.files[0].id, "")
 	if rec.Code != http.StatusConflict {
 		t.Fatalf("status=%d body=%s, want 409", rec.Code, rec.Body)
@@ -143,6 +162,9 @@ func TestActiveStreamBlocksDelete(t *testing.T) {
 	}
 }
 
+// A file shorter than two pieces must not be zeroed: all of its bytes lie in
+// pieces shared with neighbours. There is nothing to free, but plenty to
+// corrupt.
 func TestSmallFileKeepsDataInsteadOfDestroyingSharedPieces(t *testing.T) {
 	root := testRoot(t)
 	const pieceSize = int64(64 << 10)
@@ -177,10 +199,14 @@ func TestSmallFileKeepsDataInsteadOfDestroyingSharedPieces(t *testing.T) {
 	}
 }
 
+// Clearing an item's viewed marks goes through the same check as advertising
+// it in actions: the handler used to decide by its own condition, and the
+// client showed a menu entry the server then refused.
 func TestItemViewedClearFollowsActions(t *testing.T) {
 	env := newTestEnv(t)
 	cat, item := env.firstItem(t)
 
+	// No marks: the action is neither offered nor executed.
 	if contains(env.itemActionList(cat, item), actionClearViewed) {
 		t.Fatal("clear_viewed offered for an item without marks")
 	}
@@ -205,6 +231,10 @@ func TestItemViewedClearFollowsActions(t *testing.T) {
 	}
 }
 
+// Deleting what was watched does not touch what is not finished: that is
+// what the action exists for. Also: without the explicit flag the file
+// collection is not deleted at all, and without a single mark the action is
+// neither offered nor executed.
 func TestDeleteWatchedKeepsUnwatched(t *testing.T) {
 	env := newTestEnv(t)
 	cat, item := env.firstItem(t)
@@ -220,6 +250,8 @@ func TestDeleteWatchedKeepsUnwatched(t *testing.T) {
 		t.Fatalf("status=%d body=%s, want 409", rec.Code, rec.Body)
 	}
 
+	// e01 is watched to the end, e02 only started: exactly the first one must
+	// be deleted.
 	mark := func(file, state string) {
 		t.Helper()
 		rec := env.do(t, http.MethodPut, base+"/"+file+"/viewed", `{"state":"`+state+`"}`)
@@ -265,6 +297,8 @@ func TestDeleteWatchedKeepsUnwatched(t *testing.T) {
 	}
 }
 
+// All watched episodes go in one delete batch: however many there are, the
+// torrent is stopped once and rechecked once.
 func TestDeleteWatchedRunsAsOneBatch(t *testing.T) {
 	env := newTestEnv(t)
 	env.deleteDebounce = 150 * time.Millisecond
@@ -277,7 +311,7 @@ func TestDeleteWatchedRunsAsOneBatch(t *testing.T) {
 			t.Fatalf("mark %q: status=%d", file.name, rec.Code)
 		}
 	}
-	env.firstItem(t)
+	env.firstItem(t) // actions see marks from the same snapshot as the client
 
 	rec := env.do(t, http.MethodDelete, base+"?watched=true", "")
 	if rec.Code != http.StatusAccepted {
@@ -299,6 +333,8 @@ func TestDeleteWatchedRunsAsOneBatch(t *testing.T) {
 	}
 }
 
+// An intermediate symlink pointing outside must not lead file operations
+// out of the root.
 func TestOpenInRootRefusesSymlinkEscape(t *testing.T) {
 	root := testRoot(t)
 	outside := t.TempDir()
@@ -318,6 +354,9 @@ func TestOpenInRootRefusesSymlinkEscape(t *testing.T) {
 	}
 }
 
+// A corrupt viewed.json must not block startup: with Restart=on-failure that
+// would be an endless crash loop, and the whole media library would be
+// unavailable.
 func TestViewedStoreFailsOpenOnCorruptFile(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "viewed.json")
@@ -337,6 +376,7 @@ func TestViewedStoreFailsOpenOnCorruptFile(t *testing.T) {
 	}
 }
 
+// A mark change is applied in memory only together with a successful write.
 func TestViewedUpdateRevertsWhenSaveFails(t *testing.T) {
 	if os.Geteuid() == 0 {
 		t.Skip("root ignores directory permissions")
@@ -362,6 +402,7 @@ func TestViewedUpdateRevertsWhenSaveFails(t *testing.T) {
 	}
 }
 
+// Multi-range and suffix ranges used to corrupt viewing metadata.
 func TestTrackableRange(t *testing.T) {
 	for header, want := range map[string]bool{
 		"":                   true,
@@ -377,6 +418,8 @@ func TestTrackableRange(t *testing.T) {
 	}
 }
 
+// qBittorrent can answer HTTP 200 with the body "Fails."; that is a refusal,
+// not success.
 func TestPostOKTreatsFailsBodyAsError(t *testing.T) {
 	env := newTestEnv(t)
 	env.fake.mu.Lock()
@@ -387,6 +430,7 @@ func TestPostOKTreatsFailsBodyAsError(t *testing.T) {
 	}
 }
 
+// Identifiers are opaque but must survive any names.
 func TestIDRoundTrip(t *testing.T) {
 	for _, value := range []string{
 		"shows/Игра престолов.S07/эпизод 1.mkv",
@@ -394,6 +438,8 @@ func TestIDRoundTrip(t *testing.T) {
 		"single.mkv",
 	} {
 		id := pathID(value)
+		// ":" is legal in a path segment (RFC 3986, pchar), but everything else
+		// would need escaping and would fall apart on a normalizing proxy.
 		if strings.ContainsAny(id, "/?&# %+") {
 			t.Fatalf("id %q contains characters that need escaping", id)
 		}
@@ -412,6 +458,9 @@ func TestIDRoundTrip(t *testing.T) {
 	}
 }
 
+// The catalog lives in a cache and is shared by all requests: rendering has
+// no right to write to it. Only -race finds this kind of race, so we check
+// explicitly.
 func TestRenderDoesNotMutateCatalog(t *testing.T) {
 	env := newTestEnv(t)
 	cat, item := env.firstItem(t)
@@ -440,6 +489,7 @@ func TestRenderDoesNotMutateCatalog(t *testing.T) {
 	}
 }
 
+// An expired deadline must not turn into a new wait of several minutes.
 func TestPollUntilRefusesExpiredDeadline(t *testing.T) {
 	start := time.Now()
 	err := pollUntil(0, time.Millisecond, func() (bool, error) { return false, nil })
@@ -451,6 +501,10 @@ func TestPollUntilRefusesExpiredDeadline(t *testing.T) {
 	}
 }
 
+// P1: seconds pass between the "file is not being read" check and the
+// zeroing, so the player managed to start reading and got zeros under the
+// Content-Length it had been sent. An inode claim closes the window: while
+// a delete is in progress, no stream opens.
 func TestDeleteReservesInodeAgainstLateStream(t *testing.T) {
 	env := newTestEnv(t)
 	_, item := env.firstItem(t)
@@ -461,6 +515,7 @@ func TestDeleteReservesInodeAgainstLateStream(t *testing.T) {
 	}
 	key := inodeKey(info)
 
+	// A delete claim prevents opening for reading.
 	unreserve, free := env.streamReg().reserve(key)
 	if !free {
 		t.Fatal("could not reserve a quiet inode")
@@ -475,6 +530,7 @@ func TestDeleteReservesInodeAgainstLateStream(t *testing.T) {
 	}
 	unreserve()
 
+	// And symmetrically: while the file is being read, no claim can be taken.
 	release, ok := env.streamReg().acquire(key)
 	if !ok {
 		t.Fatal("could not acquire a quiet inode")
@@ -488,6 +544,10 @@ func TestDeleteReservesInodeAgainstLateStream(t *testing.T) {
 	}
 }
 
+// A stream could pass permitFile and the first complete check before DELETE
+// took the inode. If the delete managed to finish entirely and release its
+// claim before acquire, the stale metadata still must not be used for
+// ServeContent.
 func TestStreamRevalidatesFileAfterAcquire(t *testing.T) {
 	env := newTestEnv(t)
 	target := filepath.Join(env.root, "shows", "Release", "e01.mkv")
@@ -530,6 +590,9 @@ func TestStreamRevalidatesFileAfterAcquire(t *testing.T) {
 	}
 }
 
+// DELETE reserves the inode synchronously, before the operation is created
+// and the 202 is sent. Otherwise a stream that had already passed permitFile
+// could slip in before body started.
 func TestDeleteReservesFileBeforeOperationStarts(t *testing.T) {
 	env := newTestEnv(t)
 	_, item := env.firstItem(t)
@@ -552,6 +615,10 @@ func TestDeleteReservesFileBeforeOperationStarts(t *testing.T) {
 	}
 }
 
+// While an operation runs on an item, play disappears only for the files it
+// deletes. The other ready episodes can still be watched: the operation does
+// not touch their data, and there is no reason to wait for the whole
+// torrent's recheck to finish because of another episode.
 func TestOperationHidesPlayOnlyForDoomedFiles(t *testing.T) {
 	env := newTestEnv(t)
 	_, item := env.firstItem(t)
@@ -572,12 +639,16 @@ func TestOperationHidesPlayOnlyForDoomedFiles(t *testing.T) {
 		}
 	}
 
+	// The operation has finished, so the restriction goes away with it.
 	env.ops().succeed(op.ID, nil, nil)
 	if !contains(env.fileActionList(cat, busy, &busy.files[0]), actionPlay) {
 		t.Fatal("play did not come back after the operation finished")
 	}
 }
 
+// The same through the API, on a real delete: while an episode waits for its
+// delete batch, the neighbour plays, but the one being deleted does not,
+// neither in actions nor in the stream.
 func TestNeighbourPlaysWhileFileIsBeingDeleted(t *testing.T) {
 	env := newTestEnv(t)
 	env.deleteDebounce = 300 * time.Millisecond
@@ -619,6 +690,10 @@ func TestNeighbourPlaysWhileFileIsBeingDeleted(t *testing.T) {
 	}
 }
 
+// Batching is the point of the debounce window: several episodes of one item
+// need only one stop and one recheck. It was unreachable through the API
+// because the second delete was rejected as "item busy", and the whole
+// mechanism remained dead code.
 func TestSeveralDeletesOfOneItemBatchTogether(t *testing.T) {
 	env := newTestEnv(t)
 	env.deleteDebounce = 150 * time.Millisecond
@@ -638,6 +713,8 @@ func TestSeveralDeletesOfOneItemBatchTogether(t *testing.T) {
 		}
 	}
 
+	// Both episodes are excluded, but there is one stop and one recheck for
+	// all of them.
 	calls := env.fake.snapshotCalls()
 	counts := map[string]int{}
 	for _, c := range calls {
@@ -650,6 +727,8 @@ func TestSeveralDeletesOfOneItemBatchTogether(t *testing.T) {
 		t.Fatalf("recheck ran %d times, want one for the whole batch: %v", counts["recheck"], calls)
 	}
 
+	// And the inode claims are released: the files can be opened for reading
+	// again.
 	for _, name := range []string{"e01.mkv", "e02.mkv"} {
 		info, err := os.Stat(filepath.Join(env.root, "shows", "Release", name))
 		if err != nil {
@@ -661,12 +740,17 @@ func TestSeveralDeletesOfOneItemBatchTogether(t *testing.T) {
 	}
 }
 
+// "Deleted the watched episode, queued the next one for download, went off
+// to watch": while the delete was waiting for its batch and running, enable
+// used to not be offered at all, so the episode never downloaded. Now it
+// queues behind the batch and afterwards starts the torrent that the batch
+// left stopped (it was stopped before the batch as well).
 func TestEnableQueuesBehindDeleteOfNeighbour(t *testing.T) {
 	env := newTestEnv(t)
 	env.deleteDebounce = 150 * time.Millisecond
 	env.realisticRecheck(120 * time.Millisecond)
 	env.fake.mu.Lock()
-	env.fake.torrents[0].files[1].priority = 0
+	env.fake.torrents[0].files[1].priority = 0 // e02 is excluded
 	env.fake.mu.Unlock()
 	_, item := env.firstItem(t)
 	watched, next := item.files[0], item.files[1]
@@ -699,6 +783,8 @@ func TestEnableQueuesBehindDeleteOfNeighbour(t *testing.T) {
 		}
 	}
 
+	// Enable did not slip into the batch: the priority and the start come
+	// after the recheck.
 	calls := env.fake.snapshotCalls()
 	index := func(call string) int {
 		for i, c := range calls {
@@ -718,6 +804,9 @@ func TestEnableQueuesBehindDeleteOfNeighbour(t *testing.T) {
 	}
 }
 
+// The reverse order: an episode was enabled, the torrent started, and then
+// the neighbour was deleted. The batch stops the torrent for the trim and
+// must start it again, otherwise the enabled episode would stall halfway.
 func TestDeleteAfterEnableKeepsTorrentRunning(t *testing.T) {
 	env := newTestEnv(t)
 	env.deleteDebounce = 50 * time.Millisecond
@@ -758,6 +847,10 @@ func TestDeleteAfterEnableKeepsTorrentRunning(t *testing.T) {
 	}
 }
 
+// A 2160p season takes minutes to check, longer than the general operation
+// timeout. The batch used to give up waiting on timeout ("recheck did not
+// finish; torrent left stopped") and never started the torrent. As long as
+// the check is progressing, we have to wait.
 func TestLongRecheckStillRestartsTorrent(t *testing.T) {
 	env := newTestEnv(t)
 	env.deleteDebounce = 20 * time.Millisecond
@@ -780,6 +873,9 @@ func TestLongRecheckStillRestartsTorrent(t *testing.T) {
 	}
 }
 
+// While the batch rechecks the torrent (minutes for a large one), the delete
+// operation reports this as a phase instead of sitting in "waiting" until the
+// end: otherwise it looks like a hang in the client's header.
 func TestDeleteReportsBatchPhases(t *testing.T) {
 	env := newTestEnv(t)
 	env.deleteDebounce = 20 * time.Millisecond
@@ -817,6 +913,9 @@ func TestDeleteReportsBatchPhases(t *testing.T) {
 	}
 }
 
+// A manual recheck of a stopped torrent: the operation must not report
+// "done" while qBittorrent is still checking and the API still shows the old
+// stoppedUP.
 func TestItemRecheckWaitsForRealCheck(t *testing.T) {
 	env := newTestEnv(t)
 	env.realisticRecheck(150 * time.Millisecond)
@@ -837,8 +936,12 @@ func TestItemRecheckWaitsForRealCheck(t *testing.T) {
 	}
 }
 
+// Priority can be changed only for a file that is still downloading: an
+// excluded one needs enable, and a ready one has no use for ordering. The
+// result is read back from qBittorrent.
 func TestFilePriorityOnlyForUnfinishedFiles(t *testing.T) {
 	env := newTestEnv(t)
+	// e01 is a truncated stub on disk, e02 is excluded.
 	abs := filepath.Join(env.root, "shows", "Release", "e01.mkv")
 	if err := os.Truncate(abs, 0); err != nil {
 		t.Fatal(err)

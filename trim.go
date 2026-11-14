@@ -1,5 +1,12 @@
 package main
 
+// trim.go frees the space taken by a single file of a torrent.
+//
+// qBittorrent has no API to "delete one file of a torrent" (issue #9565). The
+// workaround: drop the file's priority, zero out its contents while keeping
+// one boundary piece at each end (those are shared with neighbouring files),
+// and recheck the torrent once. The client knows nothing about this mechanism.
+
 import (
 	"errors"
 	"fmt"
@@ -26,7 +33,11 @@ type deleteTarget struct {
 	info    os.FileInfo
 	match   qbMatch
 	waiters []chan *deleteBatchOutcome
-	ops     []string
+	// ops are the operations waiting on this file; the batch reports its phase
+	// to them. Otherwise the client's header would show the whole delete as
+	// "waiting", and a recheck of a large torrent takes minutes, which is easy
+	// to mistake for a hang.
+	ops []string
 }
 
 type deleteBatch struct {
@@ -40,6 +51,8 @@ type deleteBatchOutcome struct {
 	err      string
 	response map[string]any
 
+	// perTarget: an invalid file no longer fails the whole batch. Each waiter
+	// gets the result of ITS OWN file, and the rest are carried through.
 	perTarget map[string]*deleteBatchOutcome
 }
 
@@ -56,7 +69,7 @@ type preparedDelete struct {
 	target    *deleteTarget
 	file      *os.File
 	info      os.FileInfo
-	unreserve func()
+	unreserve func() // releases the inode claim; nil if the file does not exist yet
 	priority  int
 	size      int64
 }
@@ -79,8 +92,15 @@ func readAtFull(f *os.File, p []byte, off int64) error {
 	return nil
 }
 
+// errTooSmallToTrim means the file fits entirely in two pieces, so all of its
+// bytes belong to pieces shared with neighbouring files. Zeroing it would
+// corrupt data the user did not ask to delete, with nothing to gain. Such a
+// file is only excluded from the wanted set.
 var errTooSmallToTrim = errors.New("file fits in two pieces; boundary data is shared with neighbours")
 
+// trimSparseFile frees the contents of the selected file while keeping its
+// inode, logical size and edges. One full piece at each edge is enough not to
+// lose the pieces that cross the boundaries with neighbouring files.
 func trimSparseFile(f *os.File, expected os.FileInfo, pieceSize int64) (trimResult, error) {
 	if pieceSize <= 0 || pieceSize > 64<<20 {
 		return trimResult{}, fmt.Errorf("unsafe piece size %d", pieceSize)
@@ -109,6 +129,9 @@ func trimSparseFile(f *os.File, expected os.FileInfo, pieceSize int64) (trimResu
 		return trimResult{}, fmt.Errorf("read suffix: %w", err)
 	}
 
+	// Truncate acts on the inode, so it safely frees the data for both the
+	// library path and the torrent hardlink at once, without removing
+	// neighbouring files/directories.
 	if err := f.Truncate(0); err != nil {
 		return trimResult{}, fmt.Errorf("truncate to zero: %w", err)
 	}
@@ -138,6 +161,11 @@ func trimSparseFile(f *os.File, expected os.FileInfo, pieceSize int64) (trimResu
 	return trimResult{logicalSize: size, retained: int64(len(prefix) + len(suffix)), freed: freed}, nil
 }
 
+// awaitDeletes queues the files into a delete batch and waits for their
+// outcomes, one per target. It is called from an operation body, so blocking
+// here is fine: the client has already got 202. All targets are enqueued at
+// once, before the first wait; otherwise the debounce window would collect
+// not a batch but a queue of stops and rechecks.
 func (s *server) awaitDeletes(opID string, targets []*deleteTarget) []*deleteBatchOutcome {
 	results := make([]chan *deleteBatchOutcome, len(targets))
 	for i, target := range targets {
@@ -157,12 +185,18 @@ func (s *server) awaitDelete(opID string, target *deleteTarget) *deleteBatchOutc
 	return s.awaitDeletes(opID, []*deleteTarget{target})[0]
 }
 
+// pendingBatch reports whether the torrent has a delete that is scheduled but
+// not started yet. Maintenance mutating endpoints are rejected meanwhile;
+// otherwise they would wedge in between stop, priority, trim and recheck.
 func (s *server) pendingBatch(hash string) bool {
 	s.deleteMu.Lock()
 	defer s.deleteMu.Unlock()
 	return s.deleteBatches[hash] != nil
 }
 
+// cancelAllQueuedDeletes cancels all scheduled delete batches when the service
+// shuts down. None of them has changed anything yet, so cancelling is safe,
+// and the client gets an honest refusal instead of a hung request.
 func (s *server) cancelAllQueuedDeletes() {
 	s.deleteMu.Lock()
 	batches := s.deleteBatches
@@ -270,6 +304,9 @@ func closePreparedDeletes(prepared []*preparedDelete) {
 	}
 }
 
+// rollbackDeletePriorities restores the priorities and REPORTS failures:
+// errors used to be discarded with `_ =` while the client was told
+// "priority rolled back".
 func (s *server) rollbackDeletePriorities(hash string, changed []*preparedDelete) []string {
 	var failures []string
 	for i := len(changed) - 1; i >= 0; i-- {
@@ -283,6 +320,7 @@ func (s *server) rollbackDeletePriorities(hash string, changed []*preparedDelete
 	return failures
 }
 
+// rollbackNote turns the rollback result into an honest error-message suffix.
 func rollbackNote(failures []string) string {
 	if len(failures) == 0 {
 		return "priorities rolled back"
@@ -298,6 +336,9 @@ func (s *server) deleteTorrentBatch(hash string, targets []*deleteTarget) *delet
 	unlock := s.lockTorrent(hash)
 	defer unlock()
 
+	// One absolute deadline for the whole operation. Each wait inside (stop,
+	// priority per file, recheck) used to have its own timeout, so the total time
+	// was not bounded at all and the client gave up first.
 	deadline := time.Now().Add(s.operationTimeout)
 	budget := func() (time.Duration, error) {
 		left := time.Until(deadline)
@@ -330,6 +371,13 @@ func (s *server) deleteTorrentBatch(hash string, targets []*deleteTarget) *delet
 			"qbittorrent files failed, nothing deleted: %v", err)
 	}
 
+	// Validate every qBit ID/path and pin every inode that currently exists
+	// before the first qBittorrent mutation. A missing file is a valid target:
+	// priority=0 must be applicable before qBit creates or downloads it.
+	//
+	// A rejected file no longer cancels the whole batch: it gets its own
+	// refusal, and the rest are carried through. Otherwise a single foreign file
+	// in the selection silently lost the user's valid request.
 	prepared := make([]*preparedDelete, 0, len(targets))
 	rejected := make(map[string]*deleteBatchOutcome)
 	seenIDs := make(map[int]string, len(targets))
@@ -380,6 +428,9 @@ func (s *server) deleteTorrentBatch(hash string, targets []*deleteTarget) *delet
 			reject(target, http.StatusConflict, "torrent inode for %q changed", target.rel)
 			continue
 		}
+		// Open THROUGH os.Root: a symlink pointing outside (including one planted
+		// in an intermediate directory during the debounce window) cannot escape
+		// the root.
 		root := s.fsRoot()
 		if root == nil {
 			reject(target, http.StatusInternalServerError, "media root %q is not available", s.root)
@@ -397,6 +448,9 @@ func (s *server) deleteTorrentBatch(hash string, targets []*deleteTarget) *delet
 			reject(target, http.StatusConflict, "file %q changed while delete was prepared", target.rel)
 			continue
 		}
+		// A file the player is reading right now must not be zeroed. The claim
+		// is held until the operation ends: seconds pass between this check and
+		// the zeroing, and without it the player could start reading meanwhile.
 		unreserve, free := s.streamReg().reserve(inodeKey(pinnedInfo))
 		if !free {
 			_ = f.Close()
@@ -417,6 +471,7 @@ func (s *server) deleteTorrentBatch(hash string, targets []*deleteTarget) *delet
 	}
 
 	warnings := []string{}
+	// Every operation whose files the batch actually handles sees the phase.
 	phase := func(name string) {
 		seen := make(map[string]bool)
 		for _, item := range prepared {
@@ -485,7 +540,7 @@ func (s *server) deleteTorrentBatch(hash string, targets []*deleteTarget) *delet
 		path    string
 		trimmed trimResult
 		absent  bool
-		kept    bool
+		kept    bool // priority dropped, but data kept (file is smaller than two pieces)
 	}
 	deleted := make([]deletedFile, 0, len(prepared))
 	for _, item := range prepared {
@@ -501,6 +556,9 @@ func (s *server) deleteTorrentBatch(hash string, targets []*deleteTarget) *delet
 		}
 		trimmed, err := trimSparseFile(item.file, item.info, props.PieceSize)
 		if errors.Is(err, errTooSmallToTrim) {
+			// Nothing to free, and zeroing would corrupt pieces of neighbouring
+			// files. The file is excluded from the torrent and its data stays on
+			// disk; say so honestly.
 			warnings = append(warnings, fmt.Sprintf(
 				"%s: excluded from the torrent, but data kept on disk (%v)", item.target.rel, err))
 			deleted = append(deleted, deletedFile{
@@ -511,6 +569,14 @@ func (s *server) deleteTorrentBatch(hash string, targets []*deleteTarget) *delet
 			continue
 		}
 		if err != nil {
+			// Part of the inode may already be sparse, and the zeroed boundary
+			// pieces belong to NEIGHBOURING files. Priorities must not be
+			// restored (that would re-download what was deleted), but recheck
+			// and restart are mandatory; otherwise the neighbours stay corrupt
+			// and nothing re-downloads them.
+			// Start only after the recheck: in the middle of one, qBittorrent
+			// swallows the start and stops the torrent again once the check
+			// finishes.
 			note := "torrent left stopped"
 			phase("rechecking")
 			if rcErr := s.qb.recheck(hash); rcErr != nil {
@@ -545,6 +611,9 @@ func (s *server) deleteTorrentBatch(hash string, targets []*deleteTarget) *delet
 		out.perTarget = rejected
 		return out
 	}
+	// Not from the shared budget: a large torrent takes longer than that to
+	// check, and abandoning the wait would leave it stopped. The timeout counts
+	// from the last progress of the check.
 	if err := s.qb.waitRecheck(hash, prepared[0].target.match.fileID, s.operationTimeout, s.pollInterval); err != nil {
 		out := deleteBatchError(http.StatusGatewayTimeout,
 			"files trimmed, but qbittorrent recheck did not finish; torrent left stopped: %v", err)
@@ -576,12 +645,17 @@ func (s *server) deleteTorrentBatch(hash string, targets []*deleteTarget) *delet
 		"retained_boundary_bytes": totalRetained, "recheck": "complete",
 	}
 	if wasRunning {
+		// Verify the start: it used to be sent in the middle of the recheck,
+		// qBittorrent silently swallowed it, and the torrent stayed stopped despite
+		// a "successful" batch.
 		phase("restarting")
 		err := s.qb.switchTorrent(hash, "start")
 		if err == nil {
 			_, err = s.qb.waitStarted(hash, s.startTimeout(), s.pollInterval)
 		}
 		if err != nil {
+			// This used to go into a restart_error field the client never read,
+			// so the operation looked unconditionally successful.
 			warnings = append(warnings, fmt.Sprintf("torrent was not restarted: %v", err))
 			log.Printf("delete batch: restart %s failed after successful trim: %v", hash, err)
 		} else {

@@ -1,5 +1,17 @@
 package main
 
+// operations.go implements asynchronous operations.
+//
+// Everything that touches qBittorrent goes through them. The reason is
+// simple: deleting an episode may internally wait for the torrent to stop,
+// for priority changes and for a full recheck, which takes minutes. While
+// such a request was synchronous, the client's timeout was part of the
+// protocol, and any mismatch between the two looked like an error on a
+// successful operation.
+//
+// Now the request answers at once, and progress and result arrive over the
+// event stream. The client has nothing to time out.
+
 import (
 	"crypto/rand"
 	"encoding/hex"
@@ -28,24 +40,36 @@ type operation struct {
 	Warnings   []string       `json:"warnings"`
 	Result     map[string]any `json:"result"`
 
+	// doomed holds the item's files that this operation deletes. It is not
+	// sent to the client: all it needs is that play disappears for these files.
 	doomed []string
 }
 
+// Operation kinds referenced by the rules (enableQueuesBehind)
 const (
 	opFileDelete        = "file.delete"
 	opItemDeleteWatched = "item." + actionDeleteWatched
 	opFileEnable        = "file.enable"
 )
 
+// operations stores the operations and knows whether an item is busy.
+//
+// Finished ones are not removed right away: a client that reconnects after a
+// dropped connection must learn the outcome of what it started before.
 type operations struct {
 	mu     sync.Mutex
 	byID   map[string]*operation
 	order  []string
 	limit  int
-	active map[string]int
+	active map[string]int // item id -> number of unfinished operations
 
+	// doomed: item id -> file id -> number of unfinished operations deleting
+	// it. Tracked separately rather than as "item is busy": the other ready
+	// episodes can be watched while their neighbours are being deleted, since
+	// nobody touches their data.
 	doomed map[string]map[string]int
 
+	// notify is called outside the mutex with a copy of the operation.
 	notify func(operation)
 }
 
@@ -60,9 +84,12 @@ func newOperations(limit int) *operations {
 	}
 }
 
+// newRandomHex is the shared id generator for operations and drafts.
 func newRandomHex(n int) string {
 	buf := make([]byte, n)
 	if _, err := rand.Read(buf); err != nil {
+		// The only entropy source is unavailable, which is a hardware failure,
+		// and handing out predictable ids instead of an error is not acceptable.
 		panic("random id: " + err.Error())
 	}
 	return hex.EncodeToString(buf)
@@ -70,6 +97,8 @@ func newRandomHex(n int) string {
 
 func newOperationID() string { return "op_" + newRandomHex(6) }
 
+// start registers an operation. doomed holds the ids of the item's files it
+// deletes: play is not offered for them until it finishes.
 func (o *operations) start(kind, itemID string, fileID *string, doomed ...string) *operation {
 	op := &operation{
 		ID: newOperationID(), Kind: kind, Item: itemID, File: fileID,
@@ -98,6 +127,8 @@ func (o *operations) start(kind, itemID string, fileID *string, doomed ...string
 	return op
 }
 
+// evictLocked evicts the oldest FINISHED operations. An active one is never
+// evicted: otherwise the client would lose track of it in the middle of work.
 func (o *operations) evictLocked() {
 	for len(o.order) > o.limit {
 		var kept []string
@@ -113,7 +144,7 @@ func (o *operations) evictLocked() {
 		}
 		o.order = kept
 		if !removed {
-			return
+			return // nothing to evict, all operations are still running
 		}
 	}
 }
@@ -191,12 +222,19 @@ func (o *operations) get(id string) (operation, bool) {
 	return *op, true
 }
 
+// busy reports whether the item has an unfinished operation. The client
+// learns this not from a separate flag but from an empty actions list:
+// there is simply nothing to offer.
 func (o *operations) busy(itemID string) bool {
 	o.mu.Lock()
 	defer o.mu.Unlock()
 	return o.active[itemID] > 0
 }
 
+// busyBeyond reports whether the item has an unfinished operation whose kind
+// is not in allowed. It is needed where an action may queue up behind certain
+// operations but not behind any: enabling an episode waits behind deletes of
+// neighbouring ones, but not behind a stop, a recheck or removing the item.
 func (o *operations) busyBeyond(itemID string, allowed ...string) bool {
 	o.mu.Lock()
 	defer o.mu.Unlock()
@@ -214,6 +252,8 @@ func (o *operations) busyBeyond(itemID string, allowed ...string) bool {
 	return false
 }
 
+// dooms reports whether one of the item's unfinished operations deletes the
+// file.
 func (o *operations) dooms(itemID, fileID string) bool {
 	o.mu.Lock()
 	defer o.mu.Unlock()

@@ -1,5 +1,12 @@
 package main
 
+// drafts_test.go covers the "pick episodes" window: from a magnet to a
+// running torrent.
+//
+// What is guarded here above all is not convenience but data safety: a draft
+// is deleted together with its files, so every path by which a draft's hash
+// could point at someone else's torrent is covered by a separate test.
+
 import (
 	"bufio"
 	"encoding/base32"
@@ -15,6 +22,8 @@ import (
 
 const draftMagnet = "magnet:?xt=urn:btih:abcdef0123456789abcdef0123456789abcdef01&dn=Series"
 
+// draftEnv is a server where adding a magnet creates a torrent of three
+// episodes.
 func draftEnv(t *testing.T) *testEnv {
 	t.Helper()
 	env := newTestEnv(t)
@@ -48,6 +57,7 @@ func (e *testEnv) createDraft(t *testing.T, body string) apiDraft {
 	return d
 }
 
+// awaitDraft waits for the wanted draft status via the public endpoint.
 func (e *testEnv) awaitDraft(t *testing.T, id string, want ...string) apiDraft {
 	t.Helper()
 	deadline := time.Now().Add(5 * time.Second)
@@ -72,6 +82,8 @@ func (e *testEnv) awaitDraft(t *testing.T, id string, want ...string) apiDraft {
 	}
 }
 
+// The full pass: the file list arrives, an unwanted file is deselected, the
+// torrent starts.
 func TestDraftConfirmAppliesSelection(t *testing.T) {
 	env := draftEnv(t)
 	created := env.createDraft(t, `{"magnet":"`+draftMagnet+`"}`)
@@ -88,6 +100,8 @@ func TestDraftConfirmAppliesSelection(t *testing.T) {
 			t.Fatalf("file %q is not preselected", f.Name)
 		}
 	}
+	// Paths inside the torrent are the same ones the catalog will see later,
+	// and in the same order, not in .torrent index order.
 	var paths []string
 	byPath := map[string]string{}
 	for _, f := range ready.Files {
@@ -101,6 +115,7 @@ func TestDraftConfirmAppliesSelection(t *testing.T) {
 		t.Fatalf("storage=%+v", ready.Storage)
 	}
 
+	// The draft is not visible in the catalog: there is no item yet.
 	var list apiItemList
 	if err := json.Unmarshal(env.do(t, "GET", "/items", "").Body.Bytes(), &list); err != nil {
 		t.Fatal(err)
@@ -138,6 +153,7 @@ func TestDraftConfirmAppliesSelection(t *testing.T) {
 		t.Fatalf("draft was not turned into a normal item: %s", calls)
 	}
 
+	// The tags are removed, so the item has appeared in the catalog.
 	if err := json.Unmarshal(env.do(t, "GET", "/items", "").Body.Bytes(), &list); err != nil {
 		t.Fatal(err)
 	}
@@ -152,6 +168,8 @@ func TestDraftConfirmAppliesSelection(t *testing.T) {
 	}
 }
 
+// Discarding removes both the torrent and whatever got downloaded while the
+// selection was in progress.
 func TestDraftDiscardDeletesData(t *testing.T) {
 	env := draftEnv(t)
 	created := env.createDraft(t, `{"magnet":"`+draftMagnet+`"}`)
@@ -169,6 +187,8 @@ func TestDraftDiscardDeletesData(t *testing.T) {
 	}
 }
 
+// If the tag is gone, the torrent is no longer ours: its data must not be
+// deleted.
 func TestDraftDiscardRefusesUntaggedTorrent(t *testing.T) {
 	env := draftEnv(t)
 	created := env.createDraft(t, `{"magnet":"`+draftMagnet+`"}`)
@@ -188,6 +208,9 @@ func TestDraftDiscardRefusesUntaggedTorrent(t *testing.T) {
 	}
 }
 
+// A magnet of an already downloaded torrent is rejected before adding:
+// otherwise qBittorrent would put our tags on the existing torrent, and
+// discarding would take its files with it.
 func TestDraftRefusesTorrentAlreadyInLibrary(t *testing.T) {
 	env := draftEnv(t)
 	rec := env.do(t, "POST", "/drafts",
@@ -203,12 +226,18 @@ func TestDraftRefusesTorrentAlreadyInLibrary(t *testing.T) {
 	}
 }
 
+// The same case, but the infohash could not be parsed from the magnet (a v2
+// torrent): latching onto an existing torrent is caught by its add time.
 func TestDraftRejectsAdoptedExistingTorrent(t *testing.T) {
 	env := newTestEnv(t)
+	// A torrent added long ago: that is exactly the kind qBittorrent sticks
+	// the tags onto if the magnet turns out to be a duplicate.
 	env.fake.mu.Lock()
 	env.fake.torrents[0].addedOn = time.Now().Unix() - 3600
 	env.fake.mu.Unlock()
 
+	// The infohash of a v2 torrent cannot be parsed from the magnet, so the
+	// duplicate is not visible before adding; only the time check is left.
 	created := env.createDraft(t, `{"magnet":"magnet:?xt=urn:btmh:1220ff&dn=v2"}`)
 
 	d, ok := env.draftStore().get(created.ID)
@@ -234,6 +263,9 @@ func TestDraftRejectsAdoptedExistingTorrent(t *testing.T) {
 	}
 }
 
+// An empty selection means "keep the torrent for later": it is added with
+// all priorities cleared and stays stopped. A torrent with nothing selected
+// must not be started: it would be seeding nothing.
 func TestDraftConfirmWithoutSelectionAddsStopped(t *testing.T) {
 	env := draftEnv(t)
 	created := env.createDraft(t, `{"magnet":"`+draftMagnet+`"}`)
@@ -279,6 +311,9 @@ func TestDraftConfirmRejectsUnknownFile(t *testing.T) {
 	}
 }
 
+// A draft must not make a real item with the same files ambiguous:
+// otherwise adding an already downloaded series would strip it of all
+// actions.
 func TestDraftDoesNotContestExistingItem(t *testing.T) {
 	env := newTestEnv(t)
 	env.fake.mu.Lock()
@@ -300,6 +335,8 @@ func TestDraftDoesNotContestExistingItem(t *testing.T) {
 	}
 }
 
+// An abandoned draft from a previous run is swept on timeout; a fresh one
+// is not.
 func TestSweepRemovesOrphanedDrafts(t *testing.T) {
 	env := newTestEnv(t)
 	env.draftTTL = time.Minute
@@ -337,6 +374,9 @@ func TestSweepRemovesOrphanedDrafts(t *testing.T) {
 	}
 }
 
+// The selection window lives on the draft's stream: a connecting client gets
+// the state immediately, and the file list's arrival comes as the next
+// frame.
 func TestDraftEventsDeliverReadyState(t *testing.T) {
 	env := draftEnv(t)
 	env.fake.mu.Lock()
@@ -358,6 +398,9 @@ func TestDraftEventsDeliverReadyState(t *testing.T) {
 	}
 }
 
+// awaitDraftFrame reads the draft's stream until the wanted status arrives.
+// The number of frames before it is not fixed: the client connects at an
+// arbitrary moment, and the snapshot on connect may catch any stage.
 func awaitDraftFrame(t *testing.T, body *bufio.Reader, status string, timeout time.Duration) apiDraft {
 	t.Helper()
 	type result struct {
@@ -430,7 +473,7 @@ func TestMagnetInfoHash(t *testing.T) {
 	cases := map[string]string{
 		"magnet:?xt=urn:btih:0123456789ABCDEF0123456789abcdef01234567": hexHash,
 		"magnet:?dn=x&xt=urn:btih:" + base32Hash:                       hexHash,
-		"magnet:?xt=urn:btmh:1220aabb&dn=v2":                           "",
+		"magnet:?xt=urn:btmh:1220aabb&dn=v2":                           "", // v2 torrent
 		"magnet:?xt=urn:btih:tooshort":                                 "",
 		"https://example.invalid/file.torrent":                         "",
 	}
@@ -441,6 +484,9 @@ func TestMagnetInfoHash(t *testing.T) {
 	}
 }
 
+// The selection window shows the files in the same order as the item screen
+// after adding. In some releases' .torrent the episodes are shuffled, and
+// the window used to repeat qBittorrent's index order as is.
 func TestDraftFilesFollowCatalogOrder(t *testing.T) {
 	env := draftEnv(t)
 	env.fake.addFiles = []fakeFile{

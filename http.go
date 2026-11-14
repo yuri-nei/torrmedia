@@ -1,5 +1,11 @@
 package main
 
+// http.go holds the shared response plumbing.
+//
+// There are no {"ok": …} envelopes here: the answer to "did it work" is the
+// HTTP status code. A success body is the data, an error body is
+// {error, code}. One rule, with nothing for the client to forget to check.
+
 import (
 	"crypto/subtle"
 	"encoding/json"
@@ -8,6 +14,8 @@ import (
 	"net/http"
 )
 
+// Machine-readable error codes. The text is written for humans and may
+// change; the code is part of the contract.
 const (
 	codeBadRequest      = "bad_request"
 	codeUnauthorized    = "unauthorized"
@@ -40,6 +48,8 @@ func writeErr(w http.ResponseWriter, status int, code, format string, a ...any) 
 
 func writeNoContent(w http.ResponseWriter) { w.WriteHeader(http.StatusNoContent) }
 
+// decodeBody reads the JSON request body. An empty body is an empty object:
+// commands without parameters have no body at all.
 func decodeBody(r *http.Request, v any) error {
 	if r.Body == nil || r.ContentLength == 0 {
 		return nil
@@ -55,6 +65,8 @@ func decodeBody(r *http.Request, v any) error {
 func (s *server) wrap(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if s.token != "" && r.URL.Path != "/health" {
+			// Constant-time comparison: a plain != returns at the first
+			// mismatching byte and makes the token guessable by timing.
 			expected := "Bearer " + s.token
 			if subtle.ConstantTimeCompare([]byte(r.Header.Get("Authorization")), []byte(expected)) != 1 {
 				writeErr(w, http.StatusUnauthorized, codeUnauthorized, "missing or invalid token")

@@ -1,5 +1,11 @@
 package main
 
+// render.go turns the internal catalog into what is sent to the client.
+//
+// This is the only place where actions are computed. They must not be computed
+// in two places: if those diverge, the client shows a button the server then
+// refuses to execute.
+
 import "path/filepath"
 
 func nilIfEmpty(s string) *string {
@@ -46,6 +52,10 @@ func (s *server) renderDetail(cat *catalog, item *catalogItem) apiItemDetail {
 	files := make([]apiFile, 0, len(item.files))
 	for i := range item.files {
 		f := &item.files[i]
+		// The catalog is shared by all requests and lives in the cache, so it
+		// must not be written from here. A file outside the root cannot be
+		// served, so we won't report it as "ready", but we only change the
+		// local copy of the status.
 		status := f.status
 		if f.shelfRel == "" && status == fileReady {
 			status = filePartial
@@ -60,6 +70,8 @@ func (s *server) renderDetail(cat *catalog, item *catalogItem) apiItemDetail {
 	return apiItemDetail{apiItem: s.renderItem(cat, item), Files: files}
 }
 
+// fileAbs returns the absolute path of a catalog file; ok=false if the file
+// is outside the root.
 func (s *server) fileAbs(f *catalogFile) (string, bool) {
 	if f.shelfRel == "" {
 		return "", false

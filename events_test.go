@@ -1,5 +1,7 @@
 package main
 
+// events_test.go covers the state stream and the operation registry.
+
 import (
 	"bufio"
 	"encoding/json"
@@ -12,6 +14,7 @@ import (
 	"time"
 )
 
+// readFrames parses SSE the same way the client will have to.
 func readFrames(t *testing.T, body *bufio.Reader, want int, timeout time.Duration) []sseFrame {
 	t.Helper()
 	type parsed struct {
@@ -52,6 +55,8 @@ func readFrames(t *testing.T, body *bufio.Reader, want int, timeout time.Duratio
 	}
 }
 
+// A client that connects gets the picture immediately; it should not have
+// to wait for the next tick.
 func TestEventsSendSnapshotOnConnect(t *testing.T) {
 	env := newTestEnv(t)
 	env.refreshState()
@@ -80,10 +85,14 @@ func TestEventsSendSnapshotOnConnect(t *testing.T) {
 	}
 }
 
+// The item screen gets the item's details right on connect, from the
+// catalog the list was drawn from, not after an out-of-turn recompute. In
+// tests the poller is not running, so poke by itself would produce no frame
+// at all.
 func TestItemEventsSendSnapshotOnConnect(t *testing.T) {
 	env := newTestEnv(t)
 	_, item := env.firstItem(t)
-	env.refreshState()
+	env.refreshState() // catalog exists, item details don't: nobody is subscribed
 
 	srv := httptest.NewServer(env.routes())
 	defer srv.Close()
@@ -109,6 +118,9 @@ func TestItemEventsSendSnapshotOnConnect(t *testing.T) {
 	}
 }
 
+// Stopping the service releases the stream at once instead of holding
+// http.Shutdown until its deadline: a permanently connected client keeps its
+// stream open for hours.
 func TestEventsCloseAllReleasesStream(t *testing.T) {
 	env := newTestEnv(t)
 	env.refreshState()
@@ -121,7 +133,7 @@ func TestEventsCloseAllReleasesStream(t *testing.T) {
 	}
 	defer resp.Body.Close()
 	reader := bufio.NewReader(resp.Body)
-	readFrames(t, reader, 1, 3*time.Second)
+	readFrames(t, reader, 1, 3*time.Second) // got the snapshot: subscription is live
 
 	done := make(chan error, 1)
 	go func() {
@@ -136,6 +148,8 @@ func TestEventsCloseAllReleasesStream(t *testing.T) {
 	}
 }
 
+// A snapshot is sent only when the state has changed: otherwise the stream
+// would turn into the same polling, just inside out.
 func TestEventsPublishOnlyOnChange(t *testing.T) {
 	env := newTestEnv(t)
 	env.refreshState()
@@ -143,7 +157,7 @@ func TestEventsPublishOnlyOnChange(t *testing.T) {
 	sub := env.hub().subscribe(topicList)
 	defer env.hub().unsubscribe(sub)
 
-	env.refreshState()
+	env.refreshState() // nothing changed
 	if frames := sub.drain(); len(frames) != 0 {
 		t.Fatalf("unchanged state was published: %+v", frames)
 	}
@@ -159,11 +173,16 @@ func TestEventsPublishOnlyOnChange(t *testing.T) {
 	}
 }
 
+// P1: a state frame must never be lost. It used to be dropped when the
+// buffer overflowed while "last sent" was still updated, so the subscriber
+// was stuck with a stale picture until the state changed again.
 func TestStateFrameIsNeverLost(t *testing.T) {
 	hub := newEventHub()
 	sub := hub.subscribe(topicList)
 	defer hub.unsubscribe(sub)
 
+	// The subscriber does not read, while the state changes many times in a
+	// row.
 	for i := 0; i < 1000; i++ {
 		hub.publishState(topicList, []byte(`{"n":`+strconv.Itoa(i)+`}`))
 	}
@@ -175,6 +194,7 @@ func TestStateFrameIsNeverLost(t *testing.T) {
 		t.Fatalf("state=%s, want the newest", got)
 	}
 
+	// And once it has read, the next snapshot arrives as usual.
 	hub.publishState(topicList, []byte(`{"n":1000}`))
 	frames = sub.drain()
 	if len(frames) != 1 || string(frames[0].data) != `{"n":1000}` {
@@ -182,6 +202,8 @@ func TestStateFrameIsNeverLost(t *testing.T) {
 	}
 }
 
+// An operation's outcome must not be lost: the queue accumulates them
+// instead of replacing them.
 func TestOperationFramesAreQueued(t *testing.T) {
 	hub := newEventHub()
 	sub := hub.subscribe("item-1")
@@ -199,6 +221,8 @@ func TestOperationFramesAreQueued(t *testing.T) {
 	}
 }
 
+// An item's stream carries both its details and the events of its
+// operations.
 func TestItemEventsCarryOperations(t *testing.T) {
 	env := newTestEnv(t)
 	_, item := env.firstItem(t)
@@ -206,7 +230,7 @@ func TestItemEventsCarryOperations(t *testing.T) {
 
 	sub := env.hub().subscribe(item.id)
 	defer env.hub().unsubscribe(sub)
-	env.refreshState()
+	env.refreshState() // the first detail snapshot of this topic
 	sub.drain()
 
 	op := env.ops().start("test.kind", item.id, nil)
@@ -230,6 +254,8 @@ func TestItemEventsCarryOperations(t *testing.T) {
 	}
 }
 
+// A slow client must not hold up the poller: its frames are dropped, and
+// the next snapshot is complete anyway.
 func TestSlowSubscriberDoesNotBlockPublisher(t *testing.T) {
 	hub := newEventHub()
 	sub := hub.subscribe(topicList)
@@ -250,6 +276,8 @@ func TestSlowSubscriberDoesNotBlockPublisher(t *testing.T) {
 	}
 }
 
+// --- operation registry ---
+
 func TestOperationsTrackBusyAndEvict(t *testing.T) {
 	ops := newOperations(3)
 	ops.notify = func(operation) {}
@@ -265,6 +293,8 @@ func TestOperationsTrackBusyAndEvict(t *testing.T) {
 	if ops.busy("item-b") {
 		t.Fatal("item-b is still busy after all its operations finished")
 	}
+	// An active operation is never evicted: otherwise the client would lose
+	// sight of it mid-work.
 	if _, ok := ops.get(running.ID); !ok {
 		t.Fatal("running operation was evicted")
 	}

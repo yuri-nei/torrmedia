@@ -1,4 +1,16 @@
 #!/bin/bash
+# Deploys torrmedia to a server. Idempotent. Run: sudo bash deploy.sh
+#
+# It installs EXACTLY the requested version, and only if its checksum matches
+# SHA256SUMS. The script used to install an unversioned deploy/torrmedia that
+# lagged several versions behind the sources, so a fresh install got old
+# code.
+#
+#   TORRMEDIA_VERSION=2026-07-27.1 sudo -E bash deploy.sh   # explicit version
+#   sudo bash deploy.sh                              # latest in SHA256SUMS
+#
+# The firewall, reverse proxy and token are the installer's responsibility,
+# see README. The script does not expose anything to the outside by itself.
 set -euo pipefail
 SRC="$(cd "$(dirname "$0")" && pwd)"
 
@@ -23,6 +35,8 @@ echo "== 1. system user =="
 if ! id -u torrmedia &>/dev/null; then
   useradd -r -M -d /nonexistent -s /usr/sbin/nologin torrmedia
 fi
+# Sparse trim needs access to qBittorrent's files: torrmedia opens an
+# existing inode for writing, so it is a member of qBittorrent's group.
 usermod -aG qbittorrent torrmedia
 
 echo "== 2. config (created only if missing, so a filled-in password is never overwritten) =="
@@ -35,6 +49,10 @@ QBIT_URL=http://127.0.0.1:8080
 QBIT_USER=admin
 QBIT_PASS=CHANGE_ME
 
+# TORRMEDIA_TOKEN enables the Authorization: Bearer <token> check on all
+# endpoints except /health. EMPTY by default: the API is open to anyone who
+# can reach the port. Either set a token or keep the port behind a
+# firewall/VPN. Details in README.
 # TORRMEDIA_TOKEN=
 EOF
 fi
@@ -53,15 +71,21 @@ echo "== 5. permissions for sparse trim: g+w on the library, UMask 0002 for qBit
 TORRMEDIA_ROOT_DIR="$(. /etc/torrmedia/config.env; echo "${TORRMEDIA_ROOT:-/var/media/library}")"
 MEDIA_PARENT="$(dirname "$TORRMEDIA_ROOT_DIR")"
 find "$MEDIA_PARENT" -type d -exec chmod g+w {} +
+# UMask applies only to files created after qBittorrent restarts. Existing
+# files get g+w here, otherwise torrmedia cannot open them O_RDWR.
 find "$TORRMEDIA_ROOT_DIR" -type f \
   -user qbittorrent -group qbittorrent ! -perm -g+w \
   -exec chmod g+w {} +
 
+# A drop-in instead of editing the unit with sed: a qBittorrent upgrade will
+# not wipe the setting, and it stays visible apart from the packaged file.
 install -d /etc/systemd/system/qbittorrent.service.d
 QBIT_DROPIN=/etc/systemd/system/qbittorrent.service.d/10-torrmedia.conf
 QBIT_RESTART=0
 if ! grep -qs '^UMask=0002' "$QBIT_DROPIN"; then
   cat > "$QBIT_DROPIN" <<'EOF'
+# Installed by torrmedia: new files must be group-writable, otherwise
+# sparse trim cannot open them for writing.
 [Service]
 UMask=0002
 EOF

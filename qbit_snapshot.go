@@ -1,5 +1,10 @@
 package main
 
+// qbitSnapshot captures the torrents and their files in a single pass.
+//
+// That is N+1 requests to qBittorrent per poller tick, which costs nothing for
+// a dozen torrents. If there are ever hundreds, the right next step is not
+// caching here but switching to /sync/maindata with incremental updates.
 func (s *server) qbitSnapshot() ([]qbTorrentSnapshot, error) {
 	if s.qb == nil {
 		return nil, nil

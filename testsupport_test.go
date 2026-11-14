@@ -1,5 +1,10 @@
 package main
 
+// testsupport_test.go is the shared test scaffolding: a fake qBittorrent and
+// server assembly. The fake deliberately behaves like the real thing: it
+// stores priorities, changes state on commands and does not finish a recheck
+// instantly.
+
 import (
 	"crypto/rand"
 	"encoding/json"
@@ -15,7 +20,7 @@ import (
 )
 
 type fakeFile struct {
-	name     string
+	name     string // path relative to save_path
 	size     int64
 	priority int
 	progress float64
@@ -23,8 +28,8 @@ type fakeFile struct {
 
 type fakeTorrent struct {
 	hash     string
-	name     string
-	dn       string
+	name     string // name of the root folder on disk
+	dn       string // qBittorrent name if it differs from the folder (magnet dn)
 	savePath string
 	category string
 	magnet   string
@@ -33,9 +38,12 @@ type fakeTorrent struct {
 	tags     []string
 	addedOn  int64
 
+	// Recheck as qBittorrent 5.3 does it (TorrentImpl::forceRecheck): it
+	// starts a stopped torrent itself for the duration of the check and stops
+	// it afterwards, and a start during the check does not cancel that.
 	checking       bool
 	stopAfterCheck bool
-	checkProgress  float64
+	checkProgress  float64 // progress in the API while the check runs
 }
 
 func (t *fakeTorrent) hasTag(tag string) bool {
@@ -52,17 +60,23 @@ type fakeQbit struct {
 	torrents  []*fakeTorrent
 	pieceSize int64
 	calls     []string
-	failInfo  bool
+	failInfo  bool // /torrents/info responds with an error
 	recheckIn time.Duration
-	stateLag  time.Duration
+	// stateLag is how long after a recheck the API still returns the previous
+	// state: qBittorrent caches it and recomputes it once per refresh
+	// interval.
+	stateLag time.Duration
 
+	// Magnet add scenario. While addHash is empty, /torrents/add is only
+	// recorded in calls; that is how tests that do not care about adding
+	// behave.
 	addHash        string
 	addName        string
 	addSavePath    string
 	addFiles       []fakeFile
-	metadataIn     time.Duration
-	filesMissing   bool
-	ignoreStopCond bool
+	metadataIn     time.Duration // how long after add the file list appears
+	filesMissing   bool          // 404 before metadata, not an empty list
+	ignoreStopCond bool          // qBittorrent "does not support" stopCondition
 }
 
 func newFakeQbit(t *fakeTorrent) *fakeQbit {
@@ -150,6 +164,7 @@ func (f *fakeQbit) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if len(t.files) == 0 && f.filesMissing {
+			// Until the magnet's metadata arrives, there is no file list.
 			http.NotFound(w, r)
 			return
 		}
@@ -180,6 +195,8 @@ func (f *fakeQbit) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	case "/api/v2/torrents/start", "/api/v2/torrents/resume":
 		f.calls = append(f.calls, "start")
+		// During a check the torrent is already "started" for its sake: start
+		// changes nothing, and the stop after the check stays in effect.
 		if t := f.find(hash); t != nil && !t.checking {
 			t.state = "uploading"
 		}
@@ -192,6 +209,7 @@ func (f *fakeQbit) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "bad request", http.StatusBadRequest)
 			return
 		}
+		// id comes as a single value or a "|"-separated list, as in the WebAPI.
 		for _, raw := range strings.Split(r.Form.Get("id"), "|") {
 			id, err := strconv.Atoi(raw)
 			if err != nil || id < 0 || id >= len(t.files) {
@@ -285,6 +303,8 @@ func (f *fakeQbit) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				}
 			}
 			f.torrents = append(f.torrents, added)
+			// Metadata does not arrive instantly, and qBittorrent stops the
+			// torrent itself if it was asked to when adding.
 			files, delay := f.addFiles, f.metadataIn
 			stopOnMetadata := r.Form.Get("stopCondition") == "MetadataReceived" && !f.ignoreStopCond
 			go func() {
@@ -306,6 +326,8 @@ func (f *fakeQbit) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 }
 
+// testRoot returns the catalog root with symlinks resolved, as in
+// production.
 func testRoot(t *testing.T) string {
 	t.Helper()
 	root, err := filepath.EvalSymlinks(t.TempDir())
@@ -336,6 +358,8 @@ type testEnv struct {
 	root string
 }
 
+// newTestEnv starts a server with a single item "Release" of two episodes,
+// both fully on disk.
 func newTestEnv(t *testing.T) *testEnv {
 	t.Helper()
 	root := testRoot(t)
@@ -364,6 +388,8 @@ func newTestEnvWith(t *testing.T, root string, fake *fakeQbit) *testEnv {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// With a margin over the fake's stateLag (realisticRecheck), but without
+	// seconds of waiting.
 	qb.stateLag = 200 * time.Millisecond
 	store, err := newViewedStore(filepath.Join(t.TempDir(), "viewed.json"))
 	if err != nil {
@@ -373,9 +399,11 @@ func newTestEnvWith(t *testing.T, root string, fake *fakeQbit) *testEnv {
 		root: root, qb: qb, viewed: store, playback: defaultPlaybackConfig(),
 		deleteDebounce: time.Millisecond, operationTimeout: 3 * time.Second,
 		pollInterval: 5 * time.Millisecond, statePollInterval: time.Hour,
-		enableReserve:        512 << 20,
-		availableBytes:       func(string) (int64, error) { return 100 << 30, nil },
-		totalBytes:           func(string) (int64, error) { return 200 << 30, nil },
+		enableReserve:  512 << 20,
+		availableBytes: func(string) (int64, error) { return 100 << 30, nil },
+		totalBytes:     func(string) (int64, error) { return 200 << 30, nil },
+		// In tests a draft must fit into seconds: there is no reason to wait
+		// for real minutes of metadata here.
 		draftAddTimeout:      2 * time.Second,
 		draftMetadataTimeout: 2 * time.Second,
 		draftTTL:             time.Hour,
@@ -385,6 +413,7 @@ func newTestEnvWith(t *testing.T, root string, fake *fakeQbit) *testEnv {
 	return &testEnv{server: s, fake: fake, root: root}
 }
 
+// firstItem returns the catalog's only item; handy for most tests.
 func (e *testEnv) firstItem(t *testing.T) (*catalog, *catalogItem) {
 	t.Helper()
 	cat := e.buildCatalog()
@@ -395,6 +424,9 @@ func (e *testEnv) firstItem(t *testing.T) (*catalog, *catalogItem) {
 	return cat, cat.items[0]
 }
 
+// realisticRecheck turns on state lag in the fake, as in a live qBittorrent:
+// for the first 40 ms after a recheck the API still returns the previous
+// state.
 func (e *testEnv) realisticRecheck(total time.Duration) {
 	e.fake.mu.Lock()
 	defer e.fake.mu.Unlock()
@@ -402,6 +434,8 @@ func (e *testEnv) realisticRecheck(total time.Duration) {
 	e.fake.recheckIn = total
 }
 
+// settledState waits for the fake to finish the recheck and returns the
+// torrent's final state, the one the user will find it in.
 func (e *testEnv) settledState(t *testing.T) string {
 	t.Helper()
 	deadline := time.Now().Add(5 * time.Second)
@@ -419,6 +453,7 @@ func (e *testEnv) settledState(t *testing.T) string {
 	}
 }
 
+// awaitOperation waits for an operation to finish and returns it.
 func (e *testEnv) awaitOperation(t *testing.T, id string) operation {
 	t.Helper()
 	deadline := time.Now().Add(5 * time.Second)

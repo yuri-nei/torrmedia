@@ -1,5 +1,9 @@
 package main
 
+// catalog_test.go covers building the picture of the world. This is where
+// the client used to get things wrong: this is exactly where we check that
+// merging qBittorrent with the disk gives a single consistent answer.
+
 import (
 	"os"
 	"path/filepath"
@@ -32,6 +36,10 @@ func TestCatalogMergesTorrentAndDisk(t *testing.T) {
 	}
 }
 
+// An item without a category sits right in the catalog root, and its folder
+// is easy to mistake for a category; the downloaded files then pop up next to
+// the item as separate items. Found in a live run: one item was shown
+// twice.
 func TestItemInRootIsNotTreatedAsCategory(t *testing.T) {
 	root := testRoot(t)
 	const size = int64(1 << 20)
@@ -61,10 +69,14 @@ func TestItemInRootIsNotTreatedAsCategory(t *testing.T) {
 	}
 }
 
+// A file excluded from the torrent must differ from both a missing and a
+// ready one: the whole UI and all actions rest on this distinction.
 func TestCatalogFileStatuses(t *testing.T) {
 	env := newTestEnv(t)
 	const size = int64(1 << 20)
 
+	// e02 is excluded from the torrent; e03 is in the torrent but not on
+	// disk.
 	env.fake.mu.Lock()
 	env.fake.torrents[0].files[1].priority = 0
 	env.fake.torrents[0].files = append(env.fake.torrents[0].files, fakeFile{
@@ -72,6 +84,7 @@ func TestCatalogFileStatuses(t *testing.T) {
 	})
 	env.fake.mu.Unlock()
 
+	// e04 is on disk but incomplete.
 	partial := filepath.Join(env.root, "shows", "Release", "e04.mkv")
 	writeTestFile(t, partial, size)
 	if err := os.Truncate(partial, size); err != nil {
@@ -82,7 +95,7 @@ func TestCatalogFileStatuses(t *testing.T) {
 		t.Fatal(err)
 	}
 	sparse.Truncate(0)
-	sparse.Truncate(size)
+	sparse.Truncate(size) // logical size set, no blocks allocated
 	sparse.Close()
 
 	_, item := env.firstItem(t)
@@ -101,6 +114,8 @@ func TestCatalogFileStatuses(t *testing.T) {
 	}
 }
 
+// An item without a torrent must be visible and playable: torrmedia is
+// self-sufficient.
 func TestCatalogShowsShelfOnlyItem(t *testing.T) {
 	env := newTestEnv(t)
 	writeTestFile(t, filepath.Join(env.root, "movies", "Solo.mkv"), 1<<20)
@@ -126,6 +141,9 @@ func TestCatalogShowsShelfOnlyItem(t *testing.T) {
 	}
 }
 
+// qBittorrent being unreachable does not mean "the files belong to nobody".
+// What is already downloaded can be watched, but the item's state is unknown
+// and no actions are offered.
 func TestCatalogDegradesWhenQbitIsDown(t *testing.T) {
 	env := newTestEnv(t)
 	env.fake.mu.Lock()
@@ -162,6 +180,8 @@ func TestCatalogDegradesWhenQbitIsDown(t *testing.T) {
 	}
 }
 
+// Two torrents on one path cannot be addressed separately, so both lose
+// their actions.
 func TestCatalogMarksAmbiguousItems(t *testing.T) {
 	env := newTestEnv(t)
 	twin := *env.fake.torrents[0]
@@ -176,6 +196,8 @@ func TestCatalogMarksAmbiguousItems(t *testing.T) {
 		t.Fatalf("items=%d, want one ambiguous item", len(cat.items))
 	}
 	detail := env.renderDetail(cat, cat.items[0])
+	// The item must lose ALL actions: remove_with_data would take the second
+	// torrent's data with it, and recheck would check the wrong one.
 	if len(detail.Actions) != 0 {
 		t.Fatalf("ambiguous item still offers %v", detail.Actions)
 	}
@@ -186,10 +208,13 @@ func TestCatalogMarksAmbiguousItems(t *testing.T) {
 	}
 }
 
+// Matching ids are a special case. The other one is more dangerous: the items
+// have DIFFERENT ids but share a file (a common path or a hardlink). This
+// used to go undetected entirely.
 func TestCatalogDetectsSharedFileAcrossDifferentItems(t *testing.T) {
 	env := newTestEnv(t)
 	const size = int64(1 << 20)
-	shared := filepath.Join("Release", "e01.mkv")
+	shared := filepath.Join("Release", "e01.mkv") // same path, other torrent
 
 	env.fake.mu.Lock()
 	env.fake.torrents = append(env.fake.torrents, &fakeTorrent{
@@ -225,6 +250,9 @@ func TestCatalogDetectsSharedFileAcrossDifferentItems(t *testing.T) {
 	}
 }
 
+// An item's id does not change whether or not its torrent has been removed:
+// otherwise the client's open screen would fall apart right at the moment
+// the torrent is deleted.
 func TestItemIDSurvivesTorrentRemoval(t *testing.T) {
 	env := newTestEnv(t)
 	_, before := env.firstItem(t)
@@ -252,6 +280,9 @@ func contains(list []string, want string) bool {
 	return false
 }
 
+// A torrent's name in qBittorrent is the magnet link's dn, and on rutor it is
+// the same for every torrent ("rutor.info"). The catalog names an item after
+// its contents.
 func TestTitleComesFromContentNotMagnetName(t *testing.T) {
 	env := newTestEnv(t)
 	env.fake.mu.Lock()

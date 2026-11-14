@@ -1,5 +1,19 @@
 package main
 
+// events.go is the state stream (SSE).
+//
+// A single poller queries qBittorrent for all clients, instead of each client
+// polling on its own. This is not an optimization but the removal of a whole
+// class of bugs: while the client assembled its picture of the world on a
+// timer, it had races between concurrent updates, stale snapshots, and
+// optimistic states that drifted away from reality.
+//
+// Whole snapshots are sent, not deltas. With dozens of items the difference
+// in traffic is negligible, and everything that usually comes with deltas
+// goes away: sequence numbers, replaying what was missed, reconciliation and
+// divergence after a disconnect. Reconnect and you get the current picture,
+// that is all.
+
 import (
 	"bytes"
 	"encoding/json"
@@ -14,6 +28,7 @@ const (
 	eventOperation = "operation"
 	eventPing      = "ping"
 
+	// topicList is the stream with the item list; every other topic is an item id.
 	topicList = ""
 )
 
@@ -22,6 +37,17 @@ type sseFrame struct {
 	data  []byte
 }
 
+// eventSub is a subscriber. State and operations are stored differently on
+// purpose.
+//
+// State is ONE slot that gets replaced. It must not be lost: a frame used to
+// be dropped when the buffer overflowed while h.last was still updated, so
+// the subscriber was stuck with the old picture until the state changed
+// again. A slot that always holds the latest value makes this impossible.
+//
+// Operations are a queue: an operation's outcome must not be lost, and "the
+// latest" supersedes nothing here. The queue is bounded, so after a reconnect
+// the client also checks unfinished operations via GET /operations/{id}.
 type eventSub struct {
 	topic string
 
@@ -75,6 +101,7 @@ func (s *eventSub) pushPing() {
 	s.signal()
 }
 
+// drain takes everything accumulated in one go.
 func (s *eventSub) drain() (frames []sseFrame) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -103,7 +130,7 @@ func (s *eventSub) close() {
 type eventHub struct {
 	mu   sync.Mutex
 	subs map[*eventSub]struct{}
-	last map[string][]byte
+	last map[string][]byte // topic -> last computed snapshot
 }
 
 func newEventHub() *eventHub {
@@ -137,6 +164,8 @@ func (h *eventHub) hasTopicLocked(topic string) bool {
 	return false
 }
 
+// topics returns the snapshots that need computing at all. Details of an
+// item nobody is subscribed to are never assembled.
 func (h *eventHub) topics() []string {
 	h.mu.Lock()
 	defer h.mu.Unlock()
@@ -165,6 +194,9 @@ func (h *eventHub) forEach(topic string, fn func(*eventSub)) {
 	}
 }
 
+// seedState stores a snapshot only if nothing has been computed for the topic
+// yet: the poller may already have published a fresher one, and it must not
+// be overwritten with a cached one.
 func (h *eventHub) seedState(topic string, data []byte) {
 	h.mu.Lock()
 	_, seen := h.last[topic]
@@ -177,6 +209,7 @@ func (h *eventHub) seedState(topic string, data []byte) {
 	}
 }
 
+// publishState delivers a snapshot to the subscribers if it has changed.
 func (h *eventHub) publishState(topic string, data []byte) {
 	h.mu.Lock()
 	previous, seen := h.last[topic]
@@ -194,6 +227,11 @@ func (h *eventHub) publishOperationFrame(topic string, data []byte) {
 	h.forEach(topic, func(sub *eventSub) { sub.pushOperation(data) })
 }
 
+// closeAll releases all subscribers. It is called on shutdown, after the
+// started operations have been carried through: an event stream lives for
+// hours, and without this http.Shutdown would dutifully wait for it until its
+// deadline, while the client would get disconnected anyway, only 15 seconds
+// later and by systemd.
 func (h *eventHub) closeAll() {
 	h.mu.Lock()
 	subs := make([]*eventSub, 0, len(h.subs))
@@ -218,6 +256,8 @@ func (h *eventHub) publishPing() {
 	}
 }
 
+// snapshotFor returns the topic's last known snapshot, so a newly connected
+// client gets the picture immediately instead of waiting for the next tick.
 func (h *eventHub) snapshotFor(topic string) ([]byte, bool) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
@@ -225,11 +265,17 @@ func (h *eventHub) snapshotFor(topic string) ([]byte, bool) {
 	return data, ok
 }
 
+// --- poller ---
+
+// runStatePump builds the catalog on a timer and after every mutation, splits
+// it into topics and publishes the snapshots that changed.
 func (s *server) runStatePump(done <-chan struct{}) {
 	ticker := time.NewTicker(s.statePollInterval)
 	defer ticker.Stop()
 	ping := time.NewTicker(20 * time.Second)
 	defer ping.Stop()
+	// The draft sweep runs on its own, infrequent timer: it calls into
+	// qBittorrent and has nothing to do with how often the catalog refreshes.
 	sweep := time.NewTicker(time.Minute)
 	defer sweep.Stop()
 
@@ -244,6 +290,7 @@ func (s *server) runStatePump(done <-chan struct{}) {
 		case <-sweep.C:
 			s.sweepDrafts()
 		case <-s.statePoke:
+			// A short delay coalesces a burst of mutations into one recompute.
 			time.Sleep(150 * time.Millisecond)
 			drain(s.statePoke)
 			s.refreshState()
@@ -263,6 +310,8 @@ func drain(ch chan struct{}) {
 	}
 }
 
+// poke asks for the state to be recomputed right now: something changed
+// because of us, and there is no point in waiting for the next tick.
 func (s *server) poke() {
 	select {
 	case s.statePoke <- struct{}{}:
@@ -286,10 +335,14 @@ func (s *server) refreshState() {
 			continue
 		}
 		if isDraftTopic(topic) {
+			// A draft is not in the catalog and must not be: drafts.go
+			// publishes its state at the moment it changes.
 			continue
 		}
 		item := cat.item(topic)
 		if item == nil {
+			// The item is gone: the client will see that in the list and leave
+			// the screen.
 			s.hub().publishState(topic, []byte(`null`))
 			continue
 		}
@@ -302,6 +355,8 @@ func (s *server) refreshState() {
 	}
 }
 
+// --- serving the stream ---
+
 func (s *server) serveEvents(w http.ResponseWriter, r *http.Request, topic string) {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
@@ -312,6 +367,7 @@ func (s *server) serveEvents(w http.ResponseWriter, r *http.Request, topic strin
 	h.Set("Content-Type", "text/event-stream; charset=utf-8")
 	h.Set("Cache-Control", "no-cache")
 	h.Set("Connection", "keep-alive")
+	// Disables buffering in nginx, in case it ever ends up in front.
 	h.Set("X-Accel-Buffering", "no")
 	w.WriteHeader(http.StatusOK)
 	flusher.Flush()
@@ -323,6 +379,9 @@ func (s *server) serveEvents(w http.ResponseWriter, r *http.Request, topic strin
 		writeSSE(w, sseFrame{event: eventState, data: data})
 		flusher.Flush()
 	} else {
+		// The first frame comes from the already built catalog (it goes out on the
+		// first pass of the loop below); a fresh one follows an out-of-turn
+		// recompute if anything has changed.
 		s.seedTopic(topic)
 		s.poke()
 	}
@@ -349,6 +408,13 @@ func (s *server) serveEvents(w http.ResponseWriter, r *http.Request, topic strin
 	}
 }
 
+// seedTopic gives a new subscriber of an item that item's snapshot from the
+// already built catalog, the same one the list was rendered from. The poller
+// does not compute details of items nobody subscribes to, so without this the
+// first frame waited for poke, which sleeps 150 ms to coalesce mutations and
+// then calls qBittorrent, and the item screen sat without files just as long.
+// Drafts are published by drafts.go, and "no such item" must come from a
+// fresh recompute rather than the cache, so that case is left to poke.
 func (s *server) seedTopic(topic string) {
 	if topic == topicList || isDraftTopic(topic) {
 		return
@@ -370,11 +436,13 @@ func (s *server) seedTopic(topic string) {
 }
 
 func writeSSE(w http.ResponseWriter, frame sseFrame) {
+	// The data is always single-line JSON, so there is no need to split on \n.
 	w.Write([]byte("event: " + frame.event + "\ndata: "))
 	w.Write(frame.data)
 	w.Write([]byte("\n\n"))
 }
 
+// publishOperation sends an operation update to its item's stream.
 func (s *server) publishOperation(op operation) {
 	data, err := json.Marshal(op)
 	if err != nil {
@@ -382,5 +450,6 @@ func (s *server) publishOperation(op operation) {
 		return
 	}
 	s.hub().publishOperationFrame(op.Item, data)
+	// The set of actions depends on whether an operation is running; recompute.
 	s.poke()
 }

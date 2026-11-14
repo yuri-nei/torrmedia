@@ -30,6 +30,9 @@ type viewedEntry struct {
 	Updated int64  `json:"updated"`
 }
 
+// viewedFile is the STORAGE format. The response envelope is built
+// separately: there is no reason to put the ok field, which only the
+// protocol needs, into the file on disk.
 type viewedFile struct {
 	Items []viewedEntry `json:"items"`
 }
@@ -51,6 +54,10 @@ func newViewedStore(path string) (*viewedStore, error) {
 	}
 	var stored viewedFile
 	if err := json.Unmarshal(data, &stored); err != nil {
+		// Fail-open. Broken JSON used to lead to log.Fatalf, and with
+		// Restart=on-failure that is an endless crash loop: the whole media
+		// library is unavailable because of the viewed-marks file. Move the
+		// corrupt file aside and start with an empty state.
 		corrupt := fmt.Sprintf("%s.corrupt-%d", path, time.Now().Unix())
 		if renameErr := os.Rename(path, corrupt); renameErr != nil {
 			log.Printf("viewed: %q is corrupt (%v) and could not be moved aside (%v); "+
@@ -79,6 +86,9 @@ func (v *viewedStore) snapshot() map[string]viewedEntry {
 	return out
 }
 
+// update applies a change and rolls it back if saving fails. Without the
+// rollback, memory and disk diverged: /list already showed the new status,
+// while the client got a 500 and assumed nothing had changed.
 func (v *viewedStore) update(fn func(map[string]viewedEntry)) error {
 	v.mu.Lock()
 	defer v.mu.Unlock()
@@ -131,6 +141,9 @@ func (v *viewedStore) saveLocked() error {
 	if err := os.Rename(tmpName, v.path); err != nil {
 		return err
 	}
+	// fsync the directory: without it the rename may not survive a power
+	// loss, leaving on disk exactly the truncated stub that used to send the
+	// service into a crash loop.
 	dirFile, err := os.Open(dir)
 	if err != nil {
 		return err
@@ -190,6 +203,10 @@ func (s *server) viewedSize(rel string) int64 {
 	return info.Size()
 }
 
+// markViewed, clearViewedFile and clearViewedItem are the only mutations that
+// do not touch qBittorrent: they change only local state, do not take
+// minutes and never complete partially. That is why they have no operation
+// and respond immediately.
 func (s *server) markViewed(shelfRel, state string) error {
 	rel := filepath.FromSlash(shelfRel)
 	size := s.viewedSize(rel)
@@ -301,6 +318,9 @@ type countingWriter struct {
 	total *atomic.Int64
 }
 
+// Unwrap is needed by http.ResponseController and the Flusher/Hijacker
+// checks: without it the wrapper broke them precisely for tracked streams,
+// i.e. in production.
 func (w *countingWriter) Unwrap() http.ResponseWriter { return w.ResponseWriter }
 
 func (w *countingWriter) Write(p []byte) (int, error) {
@@ -309,6 +329,11 @@ func (w *countingWriter) Write(p []byte) (int, error) {
 	return n, err
 }
 
+// ReadFrom is never called explicitly and so looks dead, but it is
+// load-bearing. http.ServeContent copies via io.Copy, which prefers
+// io.ReaderFrom. Without this method io.Copy would take ReadFrom from the
+// EMBEDDED ResponseWriter, the bytes would bypass Write, and the viewing
+// counter would always show zero.
 func (w *countingWriter) ReadFrom(r io.Reader) (int64, error) {
 	buf := make([]byte, 32<<10)
 	var total int64
@@ -333,6 +358,10 @@ func (w *countingWriter) ReadFrom(r io.Reader) (int64, error) {
 	}
 }
 
+// trackableRange: progress can be counted only for a whole-file request or a
+// single range with an explicit start. A suffix range (bytes=-N) is what a
+// player sends to fetch trailing metadata, and a multipart response mixes in
+// framing bytes.
 func trackableRange(header string) bool {
 	if header == "" {
 		return true

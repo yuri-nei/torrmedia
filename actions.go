@@ -1,5 +1,12 @@
 package main
 
+// actions.go holds the operation bodies: what actually happens after the 202.
+//
+// Each function gets the operation so it can mark phases, and returns a
+// result, warnings and an error. A warning means "it worked, but": for
+// example, the data was freed but the torrent could not be restarted.
+// Swallowing that is wrong, and turning it into an error would be a lie.
+
 import (
 	"errors"
 	"fmt"
@@ -11,10 +18,16 @@ import (
 	"time"
 )
 
+// startOperation replies to the client immediately and runs the work in the
+// background. doomed holds the ids of the files the operation deletes: play is
+// not offered for them until it finishes. The operation does not block
+// playback of the item's other files.
 func (s *server) startOperation(w http.ResponseWriter, kind, itemID string, fileID *string,
 	doomed []string, body func(*operation) (map[string]any, []string, error)) {
 
 	op := s.ops().start(kind, itemID, fileID, doomed...)
+	// Take the snapshot before starting the goroutine, which then owns the
+	// operation itself.
 	snapshot, _ := s.ops().get(op.ID)
 
 	s.inflight.Add(1)
@@ -33,6 +46,11 @@ func (s *server) startOperation(w http.ResponseWriter, kind, itemID string, file
 	writeJSON(w, http.StatusAccepted, snapshot)
 }
 
+// guardTorrent takes the per-torrent lock and refuses if a file delete is
+// already scheduled for the item. Without this a maintenance command could
+// wedge in between freeing the data and the recheck, and a /remove in that
+// window made the loss unrecoverable: the files are zeroed and there is no
+// torrent left to re-download them.
 func (s *server) guardTorrent(hash string) (func(), error) {
 	if s.draining.Load() {
 		return nil, errors.New("torrmedia is shutting down")
@@ -67,6 +85,8 @@ func (s *server) runItemCommand(op *operation, hash, action string) (map[string]
 		}
 	case actionStop:
 		s.ops().phase(op.ID, "stopping")
+		// The force start flag survives a stop, and the next start would again
+		// ignore the queue and the seeding limits.
 		if err := s.qb.setForceStart(hash, false); err != nil {
 			warnings = append(warnings, fmt.Sprintf("force start was not cleared: %v", err))
 		}
@@ -81,6 +101,8 @@ func (s *server) runItemCommand(op *operation, hash, action string) (map[string]
 		if err := s.qb.recheck(hash); err != nil {
 			return nil, warnings, err
 		}
+		// The timeout counts from the last progress of the check, not from the
+		// overall budget: a large torrent takes longer than that to check.
 		if err := s.qb.waitCheckDone(hash, s.operationTimeout, s.pollInterval); err != nil {
 			return nil, warnings, err
 		}
@@ -107,6 +129,7 @@ func (s *server) runItemRemove(op *operation, item *catalogItem, deleteFiles boo
 		return map[string]any{"files_deleted": deleteFiles}, warnings, nil
 	}
 
+	// An item with no torrent: nothing to delete but the files themselves.
 	if !deleteFiles {
 		return nil, warnings, errors.New("this item has no torrent behind it")
 	}
@@ -154,6 +177,9 @@ func (s *server) runFileDelete(op *operation, item *catalogItem, file *catalogFi
 	return outcome.response, warnings, nil
 }
 
+// deleteTargetFor describes a file for a batched delete. A file missing from
+// disk is a valid target: its priority still has to be dropped, otherwise
+// qBittorrent would download it right away.
 func (s *server) deleteTargetFor(item *catalogItem, file *catalogFile) (*deleteTarget, error) {
 	abs, ok := s.fileAbs(file)
 	if !ok {
@@ -176,11 +202,20 @@ func (s *server) deleteTargetFor(item *catalogItem, file *catalogFile) (*deleteT
 	}, nil
 }
 
+// runDeleteWatched deletes watched episodes. They all go into one delete
+// batch: however many episodes there are, the torrent is stopped, rechecked
+// and started exactly once. Partly watched ones are left alone; they are not
+// in the list.
+//
+// The batch itself rejects a file that is playing right now, and that is no
+// reason to fail the rest: it ends up as a warning, not an error.
 func (s *server) runDeleteWatched(op *operation, item *catalogItem, files []catalogFile) (map[string]any, []string, error) {
 	warnings := []string{}
 	if len(files) == 0 {
 		return nil, warnings, errors.New("no watched files to delete")
 	}
+	// The batch has one response for all of its files, so its warnings arrive
+	// as many times as there are targets of ours in it.
 	seen := map[string]bool{}
 	warn := func(format string, args ...any) {
 		text := fmt.Sprintf(format, args...)
@@ -240,6 +275,9 @@ func (s *server) runDeleteWatched(op *operation, item *catalogItem, files []cata
 	return map[string]any{"deleted": deleted, "requested": len(files)}, warnings, nil
 }
 
+// reserveDeleteFile claims the existing inode before the operation is created.
+// So a stream that got through permitFile before the DELETE can no longer
+// start reading in the window between the 202 and the actual trim.
 func (s *server) reserveDeleteFile(file *catalogFile) (release func(), free bool, err error) {
 	abs, ok := s.fileAbs(file)
 	if !ok {
@@ -256,6 +294,7 @@ func (s *server) reserveDeleteFile(file *catalogFile) (release func(), free bool
 	return release, free, nil
 }
 
+// removeShelfFile deletes a catalog file that has no torrent behind it.
 func (s *server) removeShelfFile(file *catalogFile) error {
 	abs, ok := s.fileAbs(file)
 	if !ok {
@@ -277,11 +316,20 @@ func (s *server) removeShelfFile(file *catalogFile) error {
 	return nil
 }
 
+// runFileEnable returns an excluded file to downloading.
+// lockAfterDeletes waits for the item's scheduled and running deletes, then
+// takes its lock. Wedging in between a batch's stop, trim and recheck is not
+// allowed (see guardTorrent), but there is no reason to refuse either: an
+// enable queued while neighbouring episodes are being deleted simply runs
+// after the batch, with the space the batch freed and with the torrent start
+// that the batch itself does not do if the torrent was stopped.
 func (s *server) lockAfterDeletes(op *operation, hash string) (func(), error) {
 	debounce := s.deleteDebounce
 	if debounce <= 0 {
 		debounce = defaultDeleteDebounce
 	}
+	// A new delete extends the batch's debounce window, so the deadline leaves
+	// room for several windows plus the batch itself.
 	deadline := time.Now().Add(3*debounce + s.operationTimeout)
 	wait := s.pollInterval
 	if wait <= 0 {
@@ -295,10 +343,13 @@ func (s *server) lockAfterDeletes(op *operation, hash string) (func(), error) {
 			return nil, errors.New("torrmedia is shutting down; file was not enabled")
 		}
 		if !s.pendingBatch(hash) {
+			// A running batch holds this lock; wait here until it finishes.
 			unlock := s.lockTorrent(hash)
 			if !s.pendingBatch(hash) && !s.draining.Load() {
 				return unlock, nil
 			}
+			// A new delete was queued while we waited for the lock (or the
+			// service is shutting down); wait for it again.
 			unlock()
 		}
 		if time.Now().After(deadline) {
@@ -308,6 +359,7 @@ func (s *server) lockAfterDeletes(op *operation, hash string) (func(), error) {
 	}
 }
 
+// startTimeout is how long to wait for qBittorrent to confirm a torrent start.
 func (s *server) startTimeout() time.Duration {
 	return min(30*time.Second, s.operationTimeout)
 }
@@ -343,6 +395,8 @@ func (s *server) runFileEnable(op *operation, hash string, index int) (map[strin
 	if err != nil {
 		return nil, warnings, err
 	}
+	// The file downloads into download_path if that is set, and it may be on
+	// another partition.
 	spaceProbe := t.DownloadPath
 	if spaceProbe == "" {
 		spaceProbe = t.SavePath
@@ -399,6 +453,9 @@ func (s *server) runFileEnable(op *operation, hash string, index int) (map[strin
 	}, warnings, nil
 }
 
+// runFilePriority changes the priority of a file that is already downloading
+// or queued. Excluding and re-including a file are not handled here: delete
+// and enable exist for that.
 func (s *server) runFilePriority(op *operation, hash string, index, priority int) (map[string]any, []string, error) {
 	unlock, err := s.guardTorrent(hash)
 	if err != nil {
@@ -422,6 +479,8 @@ func (s *server) runFilePriority(op *operation, hash string, index, priority int
 	if !ok {
 		return nil, warnings, fmt.Errorf("file %d disappeared from the torrent", index)
 	}
+	// The file was excluded between rendering and the click: setting a priority
+	// would put it back into downloading, bypassing the space check enable does.
 	if file.Priority == 0 {
 		return nil, warnings, errors.New("file is excluded; enable it first")
 	}
@@ -430,6 +489,8 @@ func (s *server) runFilePriority(op *operation, hash string, index, priority int
 		if err := s.qb.setFilePrio(hash, index, priority); err != nil {
 			return nil, warnings, err
 		}
+		// filePrio returns 200 even when it applied nothing, so trust only
+		// the value read back.
 		if err := s.qb.waitFilePriority(hash, index, priority, s.operationTimeout, s.pollInterval); err != nil {
 			return nil, warnings, err
 		}
@@ -447,6 +508,8 @@ func (s *server) runAddMagnet(op *operation, magnet, category string) (map[strin
 	if err := s.qb.addForm(form); err != nil {
 		return nil, nil, err
 	}
+	// Neither the magnet nor its trackers go to the log: private trackers put a
+	// passkey in the URL, and the log is kept longer than it needs to be.
 	log.Printf("add: ok (category=%q source=magnet)", category)
 	s.poke()
 	return map[string]any{"added": true}, []string{}, nil
@@ -467,6 +530,8 @@ func checkCategory(category string) error {
 	return nil
 }
 
+// streamedFileOf returns the name of the item's first file that the player is
+// reading right now. Data under a playing file must not be deleted.
 func (s *server) streamedFileOf(item *catalogItem) (string, error) {
 	for i := range item.files {
 		file := &item.files[i]

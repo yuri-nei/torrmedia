@@ -1,3 +1,8 @@
+// torrmedia is a catalog of qBittorrent downloads for the forked TorrServe
+// client.
+//
+// The client contract is fully described in API.md. This file only assembles
+// the service: configuration, lifetime and graceful shutdown.
 package main
 
 import (
@@ -18,18 +23,26 @@ import (
 
 const version = "2026-11-15.2"
 
+// defaultDeleteDebounce is the window in which deletions within one item are
+// collected into a single batch. 15 s is enough to mark several episodes in a
+// row without making a single deletion wait needlessly.
 const defaultDeleteDebounce = 15 * time.Second
 
 type server struct {
-	root   string
-	osRoot *os.Root
-	token  string
-	qb     *qbit
+	root   string   // absolute, symlink-resolved, no trailing slash
+	osRoot *os.Root // all file operations go through it: no symlink can escape
+	token  string   // TORRMEDIA_TOKEN: if set, Authorization: Bearer is required
+	qb     *qbit    // nil if QBIT_URL is empty
 
+	// Operations on a single torrent are strictly sequential; otherwise two
+	// deletions would interleave stop, filePrio and recheck.
 	locks *lockTable
 
+	// A file the player is reading right now must not be zeroed.
 	streams *streamRegistry
 
+	// File deletions within one item are collected into a batch after a quiet
+	// period, so several episodes need only one stop and one recheck.
 	deleteMu       sync.Mutex
 	deleteBatches  map[string]*deleteBatch
 	deleteDebounce time.Duration
@@ -41,10 +54,11 @@ type server struct {
 	availableBytes    func(string) (int64, error)
 	totalBytes        func(string) (int64, error)
 
+	// Drafts are torrents added to learn their file list, not yet confirmed.
 	draftsStore          *drafts
-	draftAddTimeout      time.Duration
-	draftMetadataTimeout time.Duration
-	draftTTL             time.Duration
+	draftAddTimeout      time.Duration // how long to wait for the torrent after add
+	draftMetadataTimeout time.Duration // how long to wait for the magnet's metadata
+	draftTTL             time.Duration // how long an unconfirmed draft lives
 
 	viewed   *viewedStore
 	playback playbackConfig
@@ -54,12 +68,18 @@ type server struct {
 	statePoke  chan struct{}
 	catalog    atomic.Pointer[catalog]
 
+	// draining is set on SIGTERM: new mutations are rejected, ones already
+	// started run to completion, scheduled batches are cancelled.
 	draining atomic.Bool
 	inflight sync.WaitGroup
 	probe    qbitProbe
 	initOnce sync.Once
 }
 
+// ensureRuntime lazily sets up the auxiliary structures. Both main and the
+// tests build the server from a struct literal, so a single lazy initializer
+// is more reliable than requiring every construction site to remember each
+// field.
 func (s *server) ensureRuntime() {
 	s.initOnce.Do(func() {
 		if s.locks == nil {
@@ -115,6 +135,9 @@ func (s *server) streamReg() *streamRegistry {
 	return s.streams
 }
 
+// fsRoot returns the root for file operations. nil means the root could not
+// be opened, and the caller must refuse rather than fall back to an absolute
+// path.
 func (s *server) fsRoot() *os.Root {
 	s.ensureRuntime()
 	return s.osRoot
@@ -130,6 +153,8 @@ func (s *server) hub() *eventHub {
 	return s.events
 }
 
+// currentCatalog returns the most recently built catalog, or builds one
+// synchronously if the poller hasn't run yet.
 func (s *server) currentCatalog() *catalog {
 	if cat := s.catalog.Load(); cat != nil {
 		return cat
@@ -139,6 +164,8 @@ func (s *server) currentCatalog() *catalog {
 	return cat
 }
 
+// lookupItem misses on an id at most once: a just-added item may not be in
+// the cache yet, so on a miss the catalog is rebuilt.
 func (s *server) lookupItem(id string) (*catalog, *catalogItem) {
 	cat := s.currentCatalog()
 	if item := cat.item(id); item != nil {
@@ -212,7 +239,7 @@ func main() {
 	envDuration("TORRMEDIA_OPERATION_TIMEOUT", &s.operationTimeout)
 	envDuration("TORRMEDIA_DELETE_DEBOUNCE", &s.deleteDebounce)
 	envDuration("TORRMEDIA_STATE_POLL_INTERVAL", &s.statePollInterval)
-	s.ensureRuntime()
+	s.ensureRuntime() // sets the draft defaults before env overrides them
 	envDuration("TORRMEDIA_DRAFT_METADATA_TIMEOUT", &s.draftMetadataTimeout)
 	envDuration("TORRMEDIA_DRAFT_TTL", &s.draftTTL)
 
@@ -235,10 +262,14 @@ func main() {
 		Handler:           s.routes(),
 		ReadHeaderTimeout: 10 * time.Second,
 		IdleTimeout:       2 * time.Minute,
+		// No WriteTimeout: both video and the event stream are long-lived.
 	}
 	log.Printf("torrmedia %s (contract %d): listen=%s root=%s qbit=%t",
 		version, contractVersion, listen, s.root, s.qb != nil)
 
+	// Graceful shutdown. An operation must not be interrupted between freeing
+	// the data and the recheck, so whatever has started runs to completion,
+	// and whatever hasn't is cancelled with an honest response.
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
@@ -268,6 +299,8 @@ func main() {
 			log.Printf("torrmedia: in-flight operations did not finish in time")
 		}
 		close(pumpDone)
+		// Event streams are released last: until now the client was still
+		// receiving the outcomes of the operations we were finishing.
 		s.hub().closeAll()
 
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)

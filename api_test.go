@@ -1,5 +1,8 @@
 package main
 
+// api_test.go covers the external contract: routes, codes, the error
+// envelope, operations.
+
 import (
 	"encoding/json"
 	"net/http"
@@ -28,6 +31,9 @@ func TestHealthReportsContract(t *testing.T) {
 	}
 }
 
+// A resource's identity lives in the path, and the response contains exactly
+// what the contract describes: no infohashes, no file indexes, no disk
+// paths.
 func TestItemsExposeNoInternals(t *testing.T) {
 	env := newTestEnv(t)
 	rec := env.do(t, http.MethodGet, "/items", "")
@@ -36,8 +42,14 @@ func TestItemsExposeNoInternals(t *testing.T) {
 	}
 	list := decodeJSON[apiItemList](t, rec.Body.Bytes())
 
+	// The infohash inside a magnet link is inherent: sharing is the whole
+	// point of the link. The principle is a different one: the client never
+	// ADDRESSES anything by infohash, so it must not appear anywhere except
+	// the magnet.
 	body := rec.Body.String()
 	if list.Items[0].Magnet != nil {
+		// In the body the magnet is escaped by JSON rules (& -> \u0026), so
+		// we cut out the encoded form, not the original string.
 		encoded, err := json.Marshal(*list.Items[0].Magnet)
 		if err != nil {
 			t.Fatal(err)
@@ -58,6 +70,8 @@ func TestItemsExposeNoInternals(t *testing.T) {
 	if item.Status != statusStopped || item.FilesTotal != 2 || item.FilesReady != 2 {
 		t.Fatalf("item=%+v", item)
 	}
+	// The list needs both the magnet (to share right from here) and the
+	// watched counter.
 	if item.Magnet == nil || !strings.HasPrefix(*item.Magnet, "magnet:?") {
 		t.Fatalf("magnet=%v", item.Magnet)
 	}
@@ -115,12 +129,14 @@ func TestUnknownResourcesAndMethods(t *testing.T) {
 		}
 	}
 
+	// A method the resource does not have must return 405 with Allow.
 	rec := env.do(t, http.MethodPut, "/items", "")
 	if rec.Code != http.StatusMethodNotAllowed || rec.Header().Get("Allow") == "" {
 		t.Fatalf("status=%d allow=%q", rec.Code, rec.Header().Get("Allow"))
 	}
 }
 
+// A mutation responds immediately, and the result arrives as an operation.
 func TestMutationReturnsOperation(t *testing.T) {
 	env := newTestEnv(t)
 	_, item := env.firstItem(t)
@@ -144,12 +160,16 @@ func TestMutationReturnsOperation(t *testing.T) {
 	if done.FinishedAt == nil || done.Phase != nil {
 		t.Fatalf("finished operation=%+v", done)
 	}
+	// It can also be fetched once, for a client that reconnected after a
+	// disconnect.
 	rec = env.do(t, http.MethodGet, "/operations/"+op.ID, "")
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status=%d", rec.Code)
 	}
 }
 
+// Viewed marks are the only mutations without an operation: they do not
+// touch qBittorrent, do not take minutes and never complete partially.
 func TestViewedIsImmediate(t *testing.T) {
 	env := newTestEnv(t)
 	_, item := env.firstItem(t)
@@ -188,6 +208,8 @@ func TestAddAcceptsOnlyMagnet(t *testing.T) {
 	}
 }
 
+// The token guards everything except health: monitoring does not need it,
+// and everything else is destructive or contains file names.
 func TestTokenGuardsEverythingButHealth(t *testing.T) {
 	env := newTestEnv(t)
 	env.token = "secret"
@@ -219,7 +241,7 @@ func TestCategoriesErrorIsNotAnEmptyList(t *testing.T) {
 	env.fake.mu.Lock()
 	env.fake.failInfo = true
 	env.fake.mu.Unlock()
-	env.qb.base.Host = "127.0.0.1:1"
+	env.qb.base.Host = "127.0.0.1:1" // guaranteed unreachable
 	rec = env.do(t, http.MethodGet, "/categories", "")
 	if rec.Code == http.StatusOK {
 		t.Fatalf("unreachable qBittorrent returned 200: %s", rec.Body)
@@ -229,6 +251,9 @@ func TestCategoriesErrorIsNotAnEmptyList(t *testing.T) {
 	}
 }
 
+// The add-torrent operation is bound to an id that does not exist yet, so
+// its events go to the shared stream: otherwise the only way to follow it
+// would be polling, exactly what we moved away from.
 func TestAddOperationIsVisibleInTheListStream(t *testing.T) {
 	env := newTestEnv(t)
 	sub := env.hub().subscribe(topicList)

@@ -1,5 +1,11 @@
 package main
 
+// api.go holds the routes and handlers. The contract is in API.md.
+//
+// Resource identity always goes in the path, operation parameters in the
+// body, and DELETE modifiers in the query (not every HTTP client sends a body
+// with DELETE).
+
 import (
 	"net/http"
 	"strconv"
@@ -14,6 +20,7 @@ func (s *server) routes() http.Handler {
 	mux.HandleFunc("GET /storage", s.handleStorage)
 	mux.HandleFunc("GET /operations/{op}", s.handleOperation)
 
+	// Drafts: a torrent is added to learn its file list and waits for a selection.
 	mux.HandleFunc("POST /drafts", s.handleDraftCreate)
 	mux.HandleFunc("GET /drafts/{draft}", s.handleDraft)
 	mux.HandleFunc("GET /drafts/{draft}/events", s.handleDraftEvents)
@@ -45,6 +52,10 @@ func (s *server) routes() http.Handler {
 	return s.wrap(mux)
 }
 
+// --- resource resolution ---
+
+// resolve finds the item and, if requested, the file. Any miss writes the
+// response itself and returns false, so all the handler has to do is return.
 func (s *server) resolveItem(w http.ResponseWriter, r *http.Request) (*catalog, *catalogItem, bool) {
 	id := r.PathValue("item")
 	if _, err := parseID(id); err != nil {
@@ -75,6 +86,8 @@ func (s *server) resolveFile(w http.ResponseWriter, r *http.Request) (*catalog, 
 func writeDenial(w http.ResponseWriter, d *denial) {
 	writeErr(w, d.status, d.code, "%s", d.reason)
 }
+
+// --- reads ---
 
 func (s *server) handleHealth(w http.ResponseWriter, _ *http.Request) {
 	status := healthStatus{
@@ -121,6 +134,8 @@ func (s *server) handleCategories(w http.ResponseWriter, _ *http.Request) {
 	}
 	var raw map[string]qbCategory
 	if err := s.qb.getJSON("/api/v2/torrents/categories", &raw); err != nil {
+		// An empty list would mean "no categories", and the client would silently
+		// send the torrent to the default category. An error must stay an error.
 		writeErr(w, http.StatusBadGateway, codeQbitUnavailable, "qbittorrent categories: %v", err)
 		return
 	}
@@ -142,6 +157,9 @@ func (s *server) handleItems(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, s.renderList(cat))
 }
 
+// One-off GETs always rebuild the catalog: a client that has just made a
+// write must see it in its very next request. The cache exists for the event
+// stream and for resolving ids in mutations, not for reads.
 func (s *server) handleItem(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("item")
 	if _, err := parseID(id); err != nil {
@@ -173,6 +191,8 @@ func (s *server) handleOperation(w http.ResponseWriter, r *http.Request) {
 	}
 	writeJSON(w, http.StatusOK, op)
 }
+
+// --- item commands ---
 
 func (s *server) itemCommand(action string) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
@@ -220,6 +240,9 @@ func (s *server) handleItemDelete(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	snapshot := *item
+	// Removing the item with its data takes all of its files: playing them while
+	// that runs means starting something that will break off. Removing without
+	// data keeps the files.
 	var doomed []string
 	if deleteFiles {
 		for i := range item.files {
@@ -253,10 +276,14 @@ func (s *server) handleItemCreate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	magnet, category := body.Magnet, body.Category
+	// The item does not exist yet, so the operation is bound to an empty id: the
+	// client follows it in the shared stream and via /operations/{id}.
 	s.startOperation(w, "item.add", "", nil, nil, func(op *operation) (map[string]any, []string, error) {
 		return s.runAddMagnet(op, magnet, category)
 	})
 }
+
+// --- file commands ---
 
 func (s *server) handleFileDelete(w http.ResponseWriter, r *http.Request) {
 	cat, item, file, ok := s.resolveFile(w, r)
@@ -285,6 +312,9 @@ func (s *server) handleFileDelete(w http.ResponseWriter, r *http.Request) {
 		})
 }
 
+// handleWatchedDelete deletes the item's watched episodes. watched=true is a
+// mandatory explicit flag: a bare DELETE on the collection would read as
+// "delete all files", and no such action exists or should exist.
 func (s *server) handleWatchedDelete(w http.ResponseWriter, r *http.Request) {
 	cat, item, ok := s.resolveItem(w, r)
 	if !ok {
@@ -333,6 +363,9 @@ func (s *server) handleFileEnable(w http.ResponseWriter, r *http.Request) {
 		})
 }
 
+// handleFilePriority changes a file's download order. It touches qBittorrent,
+// so it is an operation, even though it usually finishes in a fraction of a
+// second.
 func (s *server) handleFilePriority(w http.ResponseWriter, r *http.Request) {
 	cat, item, file, ok := s.resolveFile(w, r)
 	if !ok {
@@ -360,6 +393,12 @@ func (s *server) handleFilePriority(w http.ResponseWriter, r *http.Request) {
 			return s.runFilePriority(op, hash, index, priority)
 		})
 }
+
+// --- viewed marks ---
+//
+// The only mutations that do not touch qBittorrent: they change only our
+// local state, cannot take minutes and cannot complete partially. So they
+// answer right away, without an operation.
 
 func (s *server) handleFileViewedSet(w http.ResponseWriter, r *http.Request) {
 	cat, item, file, ok := s.resolveFile(w, r)
