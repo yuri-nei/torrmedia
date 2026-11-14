@@ -280,7 +280,7 @@ func (s *server) removeShelfFile(file *catalogFile) error {
 func (s *server) lockAfterDeletes(op *operation, hash string) (func(), error) {
 	debounce := s.deleteDebounce
 	if debounce <= 0 {
-		debounce = 30 * time.Second
+		debounce = defaultDeleteDebounce
 	}
 	deadline := time.Now().Add(3*debounce + s.operationTimeout)
 	wait := s.pollInterval

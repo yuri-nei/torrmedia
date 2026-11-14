@@ -186,7 +186,7 @@ func (s *server) cancelAllQueuedDeletes() {
 func (s *server) enqueueTorrentDelete(target *deleteTarget) {
 	debounce := s.deleteDebounce
 	if debounce <= 0 {
-		debounce = 30 * time.Second
+		debounce = defaultDeleteDebounce
 	}
 
 	s.deleteMu.Lock()

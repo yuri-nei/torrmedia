@@ -15,7 +15,9 @@ import (
 	"time"
 )
 
-const version = "2026-11-12.1"
+const version = "2026-11-15.1"
+
+const defaultDeleteDebounce = 15 * time.Second
 
 type server struct {
 	root   string
@@ -181,7 +183,7 @@ func main() {
 		root:              root,
 		osRoot:            osRoot,
 		token:             os.Getenv("TORRMEDIA_TOKEN"),
-		deleteDebounce:    30 * time.Second,
+		deleteDebounce:    defaultDeleteDebounce,
 		operationTimeout:  5 * time.Minute,
 		pollInterval:      250 * time.Millisecond,
 		statePollInterval: 2 * time.Second,
