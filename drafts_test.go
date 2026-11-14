@@ -302,6 +302,58 @@ func TestDraftConfirmWithoutSelectionAddsStopped(t *testing.T) {
 	}
 }
 
+// A confirm that doesn't mention a category keeps the one given at creation.
+// It used to clear it, and with automatic torrent management the torrent then
+// moved to the root of the library. A category given on confirm replaces it;
+// an empty one means "no category", as it does on POST /drafts.
+func TestDraftConfirmCategory(t *testing.T) {
+	cases := []struct {
+		name    string
+		member  string // the category member of the confirm body
+		want    string
+		changed bool // whether the torrent's category is set in qBittorrent
+	}{
+		{"omitted keeps it", ``, "Shows", false},
+		{"null keeps it", `,"category":null`, "Shows", false},
+		{"given replaces it", `,"category":"Movies"`, "Movies", true},
+		{"empty clears it", `,"category":""`, "", true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			env := draftEnv(t)
+			created := env.createDraft(t, `{"magnet":"`+draftMagnet+`","category":"Shows"}`)
+			ready := env.awaitDraft(t, created.ID, draftReady)
+			if ready.Category == nil || *ready.Category != "Shows" {
+				t.Fatalf("draft category=%v", ready.Category)
+			}
+
+			body := `{"files":["` + ready.Files[0].ID + `"]` + tc.member + `}`
+			if rec := env.do(t, "POST", "/drafts/"+created.ID+"/confirm", body); rec.Code != http.StatusAccepted {
+				t.Fatalf("confirm = %d %s", rec.Code, rec.Body.String())
+			}
+			done := env.awaitDraft(t, created.ID, draftConfirmed, draftFailed)
+			env.inflight.Wait()
+			if done.Status != draftConfirmed {
+				t.Fatalf("confirm failed: %v", done.Error)
+			}
+			got := ""
+			if done.Category != nil {
+				got = *done.Category
+			}
+			env.fake.mu.Lock()
+			inQbit := env.fake.find(env.fake.addHash).category
+			env.fake.mu.Unlock()
+			if got != tc.want || inQbit != tc.want {
+				t.Fatalf("category: draft %q, qbittorrent %q, want %q", got, inQbit, tc.want)
+			}
+			setCategory := func(call string) bool { return strings.HasPrefix(call, "setCategory:") }
+			if env.hasCall(setCategory) != tc.changed {
+				t.Fatalf("calls=%v", env.fake.snapshotCalls())
+			}
+		})
+	}
+}
+
 func TestDraftConfirmRejectsUnknownFile(t *testing.T) {
 	env := draftEnv(t)
 	created := env.createDraft(t, `{"magnet":"`+draftMagnet+`"}`)

@@ -435,11 +435,16 @@ func draftFilesOf(t *qbTorrent, files []qbFile) []draftFile {
 
 // confirmDraft applies the user's choice and starts the torrent. The handler
 // has already moved the draft to confirming, so from here on it is ours alone:
-// neither DELETE nor the sweeper touches a confirming draft.
-func (s *server) confirmDraft(id string, wanted map[string]bool, category string) {
+// neither DELETE nor the sweeper touches a confirming draft. A nil category
+// keeps the one the draft was created with.
+func (s *server) confirmDraft(id string, wanted map[string]bool, category *string) {
 	current, ok := s.draftStore().get(id)
 	if !ok || current.status != draftConfirming {
 		return
+	}
+	target := current.category
+	if category != nil {
+		target = *category
 	}
 	fail := func(err error) { s.failDraft(id, draftConfirming, err) }
 	skip := []int{}
@@ -469,8 +474,8 @@ func (s *server) confirmDraft(id string, wanted map[string]bool, category string
 			return
 		}
 	}
-	if category != current.category {
-		if err := s.qb.setCategory(current.hash, category); err != nil {
+	if target != current.category {
+		if err := s.qb.setCategory(current.hash, target); err != nil {
 			fail(err)
 			return
 		}
@@ -499,7 +504,7 @@ func (s *server) confirmDraft(id string, wanted map[string]bool, category string
 	}
 	s.transitionDraft(id, []string{draftConfirming}, func(d *draft) {
 		d.status = draftConfirmed
-		d.category = category
+		d.category = target
 		d.item = s.itemIDForHash(current.hash)
 		for i := range d.files {
 			d.files[i].wanted = wanted[d.files[i].id]
@@ -723,8 +728,11 @@ func (s *server) handleDraftConfirm(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var body struct {
-		Files    []string `json:"files"`
-		Category string   `json:"category"`
+		Files []string `json:"files"`
+		// Category replaces the one given at creation; omitted or null, it
+		// keeps that one. An empty string means no category, as on POST
+		// /drafts.
+		Category *string `json:"category"`
 	}
 	if err := decodeBody(r, &body); err != nil {
 		writeErr(w, http.StatusBadRequest, codeBadRequest, "%v", err)
@@ -736,9 +744,11 @@ func (s *server) handleDraftConfirm(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusConflict, codeBusy, "draft is %s", d.status)
 		return
 	}
-	if err := checkCategory(body.Category); err != nil {
-		writeErr(w, http.StatusBadRequest, codeBadRequest, "%v", err)
-		return
+	if body.Category != nil {
+		if err := checkCategory(*body.Category); err != nil {
+			writeErr(w, http.StatusBadRequest, codeBadRequest, "%v", err)
+			return
+		}
 	}
 	known := map[string]bool{}
 	for _, f := range d.files {
