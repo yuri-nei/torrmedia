@@ -1173,3 +1173,35 @@ func TestRecheckWaitingInQueueIsNotAStall(t *testing.T) {
 		t.Fatalf("returned while still checking: %s", got.State)
 	}
 }
+
+// A piece size the trim refuses used to be found only inside the trim, after
+// the torrent was stopped and the priority dropped: the file ended up
+// excluded with all its data still on disk, and an excluded file is never
+// offered for delete again.
+func TestUnsafePieceSizeChangesNothing(t *testing.T) {
+	env := newTestEnv(t)
+	env.deleteDebounce = 20 * time.Millisecond
+	env.fake.mu.Lock()
+	env.fake.pieceSize = 128 << 20
+	env.fake.torrents[0].state = "uploading"
+	env.fake.mu.Unlock()
+	_, item := env.firstItem(t)
+
+	rec := env.do(t, http.MethodDelete, "/items/"+item.id+"/files/"+item.files[0].id, "")
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("delete: status=%d body=%s", rec.Code, rec.Body)
+	}
+	op := env.awaitOperation(t, decodeJSON[operation](t, rec.Body.Bytes()).ID)
+	if op.State != opFailed || op.Error == nil || !strings.Contains(*op.Error, "piece size") {
+		t.Fatalf("operation: %+v", op)
+	}
+	for _, call := range env.fake.snapshotCalls() {
+		if call == "stop" || strings.HasPrefix(call, "prio") || call == "recheck" {
+			t.Fatalf("qBittorrent was touched: %v", env.fake.snapshotCalls())
+		}
+	}
+	_, after := env.firstItem(t)
+	if after.files[0].status != fileReady {
+		t.Fatalf("file status after the refused delete: %s", after.files[0].status)
+	}
+}

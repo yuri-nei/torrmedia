@@ -98,12 +98,22 @@ func readAtFull(f *os.File, p []byte, off int64) error {
 // file is only excluded from the wanted set.
 var errTooSmallToTrim = errors.New("file fits in two pieces; boundary data is shared with neighbours")
 
+// maxTrimPieceSize bounds the two edge pieces a trim holds in memory.
+const maxTrimPieceSize = 64 << 20
+
+func checkPieceSize(pieceSize int64) error {
+	if pieceSize <= 0 || pieceSize > maxTrimPieceSize {
+		return fmt.Errorf("unsafe piece size %d", pieceSize)
+	}
+	return nil
+}
+
 // trimSparseFile frees the contents of the selected file while keeping its
 // inode, logical size and edges. One full piece at each edge is enough not to
 // lose the pieces that cross the boundaries with neighbouring files.
 func trimSparseFile(f *os.File, expected os.FileInfo, pieceSize int64) (trimResult, error) {
-	if pieceSize <= 0 || pieceSize > 64<<20 {
-		return trimResult{}, fmt.Errorf("unsafe piece size %d", pieceSize)
+	if err := checkPieceSize(pieceSize); err != nil {
+		return trimResult{}, err
 	}
 	current, err := f.Stat()
 	if err != nil {
@@ -364,6 +374,13 @@ func (s *server) deleteTorrentBatch(hash string, targets []*deleteTarget) *delet
 	if err != nil {
 		return deleteBatchError(http.StatusBadGateway,
 			"qbittorrent properties failed, nothing deleted: %v", err)
+	}
+	// The trim itself would refuse such a piece size, but only after the
+	// priorities were dropped: the files would end up excluded with their data
+	// still on disk, and an excluded file is never offered for delete again.
+	if err := checkPieceSize(props.PieceSize); err != nil {
+		return deleteBatchError(http.StatusConflict,
+			"cannot free space in this torrent (%v), nothing deleted", err)
 	}
 	files, err := s.qb.files(hash)
 	if err != nil {
