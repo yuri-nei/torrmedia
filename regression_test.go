@@ -5,7 +5,9 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -775,6 +777,43 @@ func TestLongRecheckStillRestartsTorrent(t *testing.T) {
 	}
 	if state := env.settledState(t); qbitStoppedState(state) {
 		t.Fatalf("torrent left %s after a long recheck", state)
+	}
+}
+
+func TestDeleteReportsBatchPhases(t *testing.T) {
+	env := newTestEnv(t)
+	env.deleteDebounce = 20 * time.Millisecond
+	env.realisticRecheck(80 * time.Millisecond)
+	env.fake.mu.Lock()
+	env.fake.torrents[0].state = "downloading"
+	env.fake.mu.Unlock()
+	var mu sync.Mutex
+	var phases []string
+	publish := env.operations.notify
+	env.operations.notify = func(op operation) {
+		if op.Phase != nil {
+			mu.Lock()
+			if len(phases) == 0 || phases[len(phases)-1] != *op.Phase {
+				phases = append(phases, *op.Phase)
+			}
+			mu.Unlock()
+		}
+		publish(op)
+	}
+	_, item := env.firstItem(t)
+
+	rec := env.do(t, http.MethodDelete, "/items/"+item.id+"/files/"+item.files[0].id, "")
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("delete: status=%d body=%s", rec.Code, rec.Body)
+	}
+	if op := env.awaitOperation(t, decodeJSON[operation](t, rec.Body.Bytes()).ID); op.State != opDone {
+		t.Fatalf("delete: %+v", op)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	want := []string{"waiting", "stopping", "trimming", "rechecking", "restarting"}
+	if !slices.Equal(phases, want) {
+		t.Fatalf("phases=%v, want %v", phases, want)
 	}
 }
 

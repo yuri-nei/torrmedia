@@ -26,6 +26,7 @@ type deleteTarget struct {
 	info    os.FileInfo
 	match   qbMatch
 	waiters []chan *deleteBatchOutcome
+	ops     []string
 }
 
 type deleteBatch struct {
@@ -137,11 +138,12 @@ func trimSparseFile(f *os.File, expected os.FileInfo, pieceSize int64) (trimResu
 	return trimResult{logicalSize: size, retained: int64(len(prefix) + len(suffix)), freed: freed}, nil
 }
 
-func (s *server) awaitDeletes(targets []*deleteTarget) []*deleteBatchOutcome {
+func (s *server) awaitDeletes(opID string, targets []*deleteTarget) []*deleteBatchOutcome {
 	results := make([]chan *deleteBatchOutcome, len(targets))
 	for i, target := range targets {
 		results[i] = make(chan *deleteBatchOutcome, 1)
 		target.waiters = []chan *deleteBatchOutcome{results[i]}
+		target.ops = []string{opID}
 		s.enqueueTorrentDelete(target)
 	}
 	out := make([]*deleteBatchOutcome, len(targets))
@@ -151,8 +153,8 @@ func (s *server) awaitDeletes(targets []*deleteTarget) []*deleteBatchOutcome {
 	return out
 }
 
-func (s *server) awaitDelete(target *deleteTarget) *deleteBatchOutcome {
-	return s.awaitDeletes([]*deleteTarget{target})[0]
+func (s *server) awaitDelete(opID string, target *deleteTarget) *deleteBatchOutcome {
+	return s.awaitDeletes(opID, []*deleteTarget{target})[0]
 }
 
 func (s *server) pendingBatch(hash string) bool {
@@ -198,6 +200,7 @@ func (s *server) enqueueTorrentDelete(target *deleteTarget) {
 	}
 	if existing := batch.targets[target.rel]; existing != nil {
 		existing.waiters = append(existing.waiters, target.waiters...)
+		existing.ops = append(existing.ops, target.ops...)
 	} else {
 		batch.targets[target.rel] = target
 	}
@@ -414,9 +417,21 @@ func (s *server) deleteTorrentBatch(hash string, targets []*deleteTarget) *delet
 	}
 
 	warnings := []string{}
+	phase := func(name string) {
+		seen := make(map[string]bool)
+		for _, item := range prepared {
+			for _, id := range item.target.ops {
+				if !seen[id] {
+					seen[id] = true
+					s.ops().phase(id, name)
+				}
+			}
+		}
+	}
 
 	wasRunning := !qbitStoppedState(torrent.State)
 	if wasRunning {
+		phase("stopping")
 		if err := s.qb.switchTorrent(hash, "stop"); err != nil {
 			out := deleteBatchError(http.StatusBadGateway,
 				"qbittorrent stop failed, nothing deleted: %v", err)
@@ -436,6 +451,7 @@ func (s *server) deleteTorrentBatch(hash string, targets []*deleteTarget) *delet
 		}
 	}
 
+	phase("trimming")
 	changed := make([]*preparedDelete, 0, len(prepared))
 	for _, item := range prepared {
 		if item.priority == 0 {
@@ -496,11 +512,13 @@ func (s *server) deleteTorrentBatch(hash string, targets []*deleteTarget) *delet
 		}
 		if err != nil {
 			note := "torrent left stopped"
+			phase("rechecking")
 			if rcErr := s.qb.recheck(hash); rcErr != nil {
 				note = fmt.Sprintf("recheck also failed: %v", rcErr)
 			} else if wasRunning {
 				startErr := s.qb.waitCheckDone(hash, s.operationTimeout, s.pollInterval)
 				if startErr == nil {
+					phase("restarting")
 					startErr = s.qb.switchTorrent(hash, "start")
 				}
 				if startErr == nil {
@@ -520,6 +538,7 @@ func (s *server) deleteTorrentBatch(hash string, targets []*deleteTarget) *delet
 		}
 		deleted = append(deleted, deletedFile{path: item.target.rel, trimmed: trimmed})
 	}
+	phase("rechecking")
 	if err := s.qb.recheck(hash); err != nil {
 		out := deleteBatchError(http.StatusBadGateway,
 			"files trimmed, but qbittorrent recheck failed; torrent left stopped: %v", err)
@@ -557,6 +576,7 @@ func (s *server) deleteTorrentBatch(hash string, targets []*deleteTarget) *delet
 		"retained_boundary_bytes": totalRetained, "recheck": "complete",
 	}
 	if wasRunning {
+		phase("restarting")
 		err := s.qb.switchTorrent(hash, "start")
 		if err == nil {
 			_, err = s.qb.waitStarted(hash, s.startTimeout(), s.pollInterval)

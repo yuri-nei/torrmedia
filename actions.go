@@ -142,7 +142,7 @@ func (s *server) runFileDelete(op *operation, item *catalogItem, file *catalogFi
 		return nil, nil, err
 	}
 	s.ops().phase(op.ID, "waiting")
-	outcome := s.awaitDelete(target)
+	outcome := s.awaitDelete(op.ID, target)
 	if outcome.err != "" {
 		return nil, nil, errors.New(outcome.err)
 	}
@@ -222,7 +222,7 @@ func (s *server) runDeleteWatched(op *operation, item *catalogItem, files []cata
 
 	s.ops().phase(op.ID, "waiting")
 	deleted := 0
-	for i, outcome := range s.awaitDeletes(targets) {
+	for i, outcome := range s.awaitDeletes(op.ID, targets) {
 		if outcome.err != "" {
 			warn("%s: %s", filepath.Base(targets[i].rel), outcome.err)
 			continue
